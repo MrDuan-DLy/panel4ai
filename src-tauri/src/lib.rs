@@ -737,44 +737,37 @@ async fn get_claude_usage_snapshot(
         }
     }
 
-    // First attempt. Only retry 429 if retry-after is short (< 30s).
-    // Long retry-after (e.g. 2600s) means Anthropic is throttling the token — retrying is pointless.
-    let first_result = match fetch_claude_usage(client, &tokens.access_token).await {
-        Err(ApiFetchError::RateLimited {
-            retry_after_secs: Some(secs),
-        }) if secs <= 30 => {
-            log::info!("Claude usage 429 (retry-after {secs}s), waiting...");
-            tokio::time::sleep(std::time::Duration::from_secs(secs.max(2))).await;
-            fetch_claude_usage(client, &tokens.access_token).await
-        }
-        Err(ApiFetchError::RateLimited {
-            retry_after_secs: None,
-        }) => {
-            log::info!("Claude usage 429 (no retry-after), retrying after 10s...");
-            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-            fetch_claude_usage(client, &tokens.access_token).await
-        }
-        other => other,
-    };
+    // First attempt
+    let first_result = fetch_claude_usage(client, &tokens.access_token).await;
 
+    // Handle errors: for both 429 (rate limited) and 401 (unauthorized), try refreshing
+    // the token first. The /api/oauth/usage rate limit is per-access-token, so a fresh
+    // token gets a new rate limit window (see anthropics/claude-code#30930).
     let usage = match first_result {
         Ok(usage) => usage,
-        Err(ApiFetchError::Unauthorized) => {
+        Err(ApiFetchError::RateLimited { .. }) | Err(ApiFetchError::Unauthorized) => {
             let refresh_token = tokens
-        .refresh_token
-        .clone()
-        .ok_or_else(|| "Claude token expired and no refresh token found. Please run `claude auth login`.".to_string())?;
+                .refresh_token
+                .clone()
+                .ok_or_else(|| "Claude token rate-limited and no refresh token found. Please run `claude auth login`.".to_string())?;
 
-            let refreshed = refresh_claude_oauth_token(client, &refresh_token).await?;
-            apply_claude_refresh(&mut tokens, refreshed);
-            source.auth.claude_ai_oauth = Some(tokens.clone());
-            if let Some(path) = source.path.as_ref() {
-                persist_claude_credentials_file(path, &source.auth)?;
+            match refresh_claude_oauth_token(client, &refresh_token).await {
+                Ok(refreshed) => {
+                    log::info!("Claude usage 429/401 — refreshed token for new rate limit window");
+                    apply_claude_refresh(&mut tokens, refreshed);
+                    source.auth.claude_ai_oauth = Some(tokens.clone());
+                    if let Some(path) = source.path.as_ref() {
+                        persist_claude_credentials_file(path, &source.auth)?;
+                    }
+                    fetch_claude_usage(client, &tokens.access_token)
+                        .await
+                        .map_err(ApiFetchError::message)?
+                }
+                Err(refresh_err) => {
+                    log::warn!("Claude token refresh failed after 429/401: {refresh_err}");
+                    return Err(first_result.unwrap_err().message());
+                }
             }
-
-            fetch_claude_usage(client, &tokens.access_token)
-                .await
-                .map_err(ApiFetchError::message)?
         }
         Err(err) => return Err(err.message()),
     };
