@@ -10,7 +10,7 @@ const CLAUDE_OAUTH_SCOPES = 'user:profile user:inference user:sessions:claude_co
 
 const defaultSettings: AppSettings = {
   provider: 'openai_oauth',
-  refreshIntervalSec: 60,
+  refreshIntervalSec: 120,
   alertThresholdPercent: 20,
   collapseDelayMs: 0,
   autoStart: true,
@@ -407,6 +407,7 @@ function App() {
 
             <div className="status-row">
               {loading ? 'Refreshing...' : `Updated: ${lastUpdated}`}
+              <span className="version-tag">v0.1.2</span>
             </div>
 
             {!oauthStatus.available && (

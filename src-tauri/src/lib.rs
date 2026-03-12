@@ -67,7 +67,7 @@ impl Default for AppSettings {
 
         Self {
             provider: "openai_oauth".to_string(),
-            refresh_interval_sec: 60,
+            refresh_interval_sec: 120,
             alert_threshold_percent: 20.0,
             collapse_delay_ms: 0,
             auto_start: true,
