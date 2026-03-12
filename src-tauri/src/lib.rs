@@ -948,7 +948,7 @@ async fn fetch_claude_usage(
         .header("Authorization", format!("Bearer {access_token}"))
         .header("anthropic-beta", CLAUDE_OAUTH_BETA_HEADER)
         .header("Content-Type", "application/json")
-        .header("User-Agent", "claude-code/1.0.17")
+        .header("User-Agent", concat!("panel4ai/", env!("CARGO_PKG_VERSION")))
         .send()
         .await
         .map_err(|e| ApiFetchError::Http(e.to_string()))?;
@@ -985,6 +985,8 @@ async fn refresh_claude_oauth_token(
 ) -> Result<ClaudeOAuthRefreshResponse, String> {
     let response = client
         .post(CLAUDE_OAUTH_TOKEN_URL)
+        .header("anthropic-beta", CLAUDE_OAUTH_BETA_HEADER)
+        .header("Content-Type", "application/json")
         .json(&serde_json::json!({
             "grant_type": "refresh_token",
             "refresh_token": refresh_token,
