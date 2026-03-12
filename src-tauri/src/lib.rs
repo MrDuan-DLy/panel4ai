@@ -1902,7 +1902,7 @@ mod tests {
     fn app_settings_default_values() {
         let s = AppSettings::default();
         assert_eq!(s.provider, "openai_oauth");
-        assert_eq!(s.refresh_interval_sec, 60);
+        assert_eq!(s.refresh_interval_sec, 120);
         assert_eq!(s.alert_threshold_percent, 20.0);
         assert_eq!(s.collapse_delay_ms, 0);
         assert!(s.auto_start);
