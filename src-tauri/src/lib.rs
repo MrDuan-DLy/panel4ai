@@ -296,6 +296,11 @@ fn error_snapshot(provider: &str, error: String) -> UsageSnapshot {
 }
 
 #[tauri::command]
+fn get_platform() -> String {
+    std::env::consts::OS.to_string()
+}
+
+#[tauri::command]
 fn get_settings(state: State<'_, AppState>) -> AppSettings {
     state
         .settings
@@ -403,11 +408,17 @@ fn resize_panel(app: AppHandle, height: u32) -> Result<(), String> {
         .get_webview_window(MAIN_WINDOW_LABEL)
         .ok_or_else(|| "Main window not found".to_string())?;
 
-    // Maintain bottom edge: grow/shrink upward
     let current_pos = window.outer_position().map_err(|e| e.to_string())?;
     let current_size = window.outer_size().map_err(|e| e.to_string())?;
-    let bottom_y = current_pos.y + current_size.height as i32;
-    let new_y = bottom_y - height as i32;
+
+    let new_y = if cfg!(target_os = "macos") {
+        // macOS: anchor top edge, grow downward
+        current_pos.y
+    } else {
+        // Windows: anchor bottom edge, grow upward
+        let bottom_y = current_pos.y + current_size.height as i32;
+        bottom_y - height as i32
+    };
 
     window
         .set_size(Size::Physical(PhysicalSize::new(PANEL_WIDTH, height)))
@@ -1590,13 +1601,24 @@ async fn exchange_claude_auth_code(
     Ok(())
 }
 
-fn position_panel_near_tray(window: &tauri::WebviewWindow, tray_pos: Position, height: u32) {
-    let (tx, ty) = match tray_pos {
+fn position_panel_near_tray(window: &tauri::WebviewWindow, tray_rect: &tauri::Rect, height: u32) {
+    let (tx, ty) = match tray_rect.position {
         Position::Physical(p) => (p.x as f64, p.y as f64),
         Position::Logical(p) => (p.x, p.y),
     };
+    let tray_height = match tray_rect.size {
+        Size::Physical(s) => s.height as f64,
+        Size::Logical(s) => s.height,
+    };
+
     let x = (tx - PANEL_WIDTH as f64 / 2.0) as i32;
-    let y = (ty - height as f64 - 8.0) as i32;
+    let y = if cfg!(target_os = "macos") {
+        // macOS: menu bar at top, panel drops below tray icon
+        (ty + tray_height + 4.0) as i32
+    } else {
+        // Windows: taskbar at bottom, panel appears above tray icon
+        (ty - height as f64 - 8.0) as i32
+    };
 
     let _ = window.set_size(Size::Physical(PhysicalSize::new(PANEL_WIDTH, height)));
     let _ = window.set_position(Position::Physical(PhysicalPosition::new(x, y)));
@@ -1629,7 +1651,7 @@ fn setup_tray(app: &tauri::App) -> Result<(), String> {
                     state.hover_generation.fetch_add(1, Ordering::Relaxed);
                     if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
                         if !window.is_visible().unwrap_or(false) {
-                            position_panel_near_tray(&window, rect.position, PANEL_HEIGHT);
+                            position_panel_near_tray(&window, &rect, PANEL_HEIGHT);
                             let _ = window.show();
                             // No set_focus — hover is just a preview
                         }
@@ -1672,7 +1694,7 @@ fn setup_tray(app: &tauri::App) -> Result<(), String> {
                         } else {
                             state.panel_pinned.store(true, Ordering::Relaxed);
                             if !window.is_visible().unwrap_or(false) {
-                                position_panel_near_tray(&window, rect.position, PANEL_HEIGHT);
+                                position_panel_near_tray(&window, &rect, PANEL_HEIGHT);
                                 let _ = window.show();
                             }
                             let _ = window.set_focus();
@@ -1723,6 +1745,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            get_platform,
             get_settings,
             get_oauth_status,
             save_settings,

@@ -94,6 +94,7 @@ function setupMocks(overrides?: {
 
   mockedInvoke.mockImplementation(async (cmd: string) => {
     switch (cmd) {
+      case 'get_platform': return 'windows'
       case 'get_settings': return settings
       case 'get_oauth_status': return oauth
       case 'get_all_usage_snapshots': return snapshots

@@ -61,6 +61,7 @@ function getTrayStatus(items: UsageSnapshot[]): 'ok' | 'warning' | 'danger' {
 }
 
 function App() {
+  const [platform, setPlatform] = useState('windows')
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [settings, setSettings] = useState<AppSettings>(defaultSettings)
   const [oauthStatus, setOauthStatus] = useState<OAuthStatus>(defaultOAuthStatus)
@@ -176,6 +177,8 @@ function App() {
 
   useEffect(() => {
     const init = async () => {
+      const p = await invoke<string>('get_platform')
+      setPlatform(p)
       await loadSettings()
       await loadOAuthStatus()
     }
@@ -432,7 +435,7 @@ function App() {
                 onChange={(e) =>
                   setSettings({ ...settings, codexAuthPath: e.target.value })
                 }
-                placeholder="C:\\Users\\you\\.codex\\auth.json"
+                placeholder={platform === 'macos' ? '~/.codex/auth.json' : 'C:\\Users\\you\\.codex\\auth.json'}
               />
             </label>
             <div className="login-section">
@@ -458,7 +461,7 @@ function App() {
                 onChange={(e) =>
                   setSettings({ ...settings, claudeAuthPath: e.target.value })
                 }
-                placeholder="C:\\Users\\you\\.claude\\.credentials.json"
+                placeholder={platform === 'macos' ? '~/.claude/.credentials.json' : 'C:\\Users\\you\\.claude\\.credentials.json'}
               />
             </label>
 

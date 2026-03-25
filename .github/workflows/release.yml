@@ -10,7 +10,11 @@ permissions:
 
 jobs:
   build-and-release:
-    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
@@ -38,6 +42,6 @@ jobs:
         with:
           tagName: ${{ github.ref_name }}
           releaseName: 'panel4ai ${{ github.ref_name }}'
-          releaseBody: 'See the assets below to download and install panel4ai for Windows.'
+          releaseBody: 'See the assets below to download and install panel4ai.'
           releaseDraft: false
           prerelease: false
