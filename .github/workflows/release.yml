@@ -42,6 +42,22 @@ jobs:
         with:
           tagName: ${{ github.ref_name }}
           releaseName: 'panel4ai ${{ github.ref_name }}'
-          releaseBody: 'See the assets below to download and install panel4ai.'
+          releaseBody: |
+            ## Downloads
+            Grab the installer for your platform from the assets below.
+
+            ### macOS — first-launch note (unsigned build)
+            This build is ad-hoc signed only (no Apple Developer ID). macOS blocks downloads from the internet with a quarantine flag, which shows **"panel4ai.app is damaged"** or **"unidentified developer"**.
+
+            After installing into `/Applications`, run this once in Terminal to remove the quarantine flag:
+
+            ```
+            xattr -dr com.apple.quarantine /Applications/panel4ai.app
+            ```
+
+            Then open the app normally. This is a one-time step per install.
+
+            ### Windows
+            Run the `.msi` or `.exe` installer. You may need to click "More info" → "Run anyway" on SmartScreen the first time.
           releaseDraft: false
           prerelease: false
