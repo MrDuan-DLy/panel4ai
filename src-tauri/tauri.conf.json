@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "panel4ai",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "identifier": "ai.panel4.desktop",
   "build": {
     "frontendDist": "../dist",
@@ -10,6 +10,7 @@
     "beforeBuildCommand": "npm run build"
   },
   "app": {
+    "macOSPrivateApi": true,
     "windows": [
       {
         "label": "main",
@@ -21,7 +22,11 @@
         "decorations": false,
         "alwaysOnTop": true,
         "skipTaskbar": true,
-        "visible": false
+        "visible": false,
+        "transparent": true,
+        "shadow": true,
+        "acceptFirstMouse": true,
+        "hiddenTitle": true
       }
     ],
     "security": {

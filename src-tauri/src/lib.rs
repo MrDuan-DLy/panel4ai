@@ -8,7 +8,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Manager, PhysicalPosition, PhysicalSize, Position, Size, State};
+use tauri::{
+    AppHandle, LogicalPosition, LogicalSize, Manager, PhysicalPosition, PhysicalSize, Position,
+    Size, State,
+};
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt as AutoStartExt};
 use tauri_plugin_notification::NotificationExt;
 
@@ -411,7 +414,8 @@ fn resize_panel(app: AppHandle, height: u32) -> Result<(), String> {
     let current_pos = window.outer_position().map_err(|e| e.to_string())?;
     let current_size = window.outer_size().map_err(|e| e.to_string())?;
 
-    let new_y = if cfg!(target_os = "macos") {
+    let mut new_x = current_pos.x;
+    let mut new_y = if cfg!(target_os = "macos") {
         // macOS: anchor top edge, grow downward
         current_pos.y
     } else {
@@ -420,14 +424,23 @@ fn resize_panel(app: AppHandle, height: u32) -> Result<(), String> {
         bottom_y - height as i32
     };
 
+    if let Ok(Some(mon)) = window.current_monitor() {
+        let mp = mon.position();
+        let sz = mon.size();
+        let left = mp.x;
+        let top = mp.y;
+        let right = left + sz.width as i32;
+        let bottom = top + sz.height as i32;
+        let margin = 4;
+        new_x = new_x.clamp(left + margin, right - PANEL_WIDTH as i32 - margin);
+        new_y = new_y.clamp(top + margin, bottom - height as i32 - margin);
+    }
+
     window
         .set_size(Size::Physical(PhysicalSize::new(PANEL_WIDTH, height)))
         .map_err(|e| e.to_string())?;
     window
-        .set_position(Position::Physical(PhysicalPosition::new(
-            current_pos.x,
-            new_y,
-        )))
+        .set_position(Position::Physical(PhysicalPosition::new(new_x, new_y)))
         .map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -1602,26 +1615,39 @@ async fn exchange_claude_auth_code(
 }
 
 fn position_panel_near_tray(window: &tauri::WebviewWindow, tray_rect: &tauri::Rect, height: u32) {
+    let scale = window.scale_factor().unwrap_or(1.0);
     let (tx, ty) = match tray_rect.position {
-        Position::Physical(p) => (p.x as f64, p.y as f64),
+        Position::Physical(p) => (p.x as f64 / scale, p.y as f64 / scale),
         Position::Logical(p) => (p.x, p.y),
     };
-    let tray_height = match tray_rect.size {
-        Size::Physical(s) => s.height as f64,
+    let tray_h = match tray_rect.size {
+        Size::Physical(s) => s.height as f64 / scale,
         Size::Logical(s) => s.height,
     };
 
-    let x = (tx - PANEL_WIDTH as f64 / 2.0) as i32;
-    let y = if cfg!(target_os = "macos") {
-        // macOS: menu bar at top, panel drops below tray icon
-        (ty + tray_height + 4.0) as i32
+    let panel_w = PANEL_WIDTH as f64;
+    let panel_h = height as f64;
+    let mut x = tx - panel_w / 2.0;
+    let mut y = if cfg!(target_os = "macos") {
+        ty + tray_h + 4.0
     } else {
-        // Windows: taskbar at bottom, panel appears above tray icon
-        (ty - height as f64 - 8.0) as i32
+        ty - panel_h - 8.0
     };
 
-    let _ = window.set_size(Size::Physical(PhysicalSize::new(PANEL_WIDTH, height)));
-    let _ = window.set_position(Position::Physical(PhysicalPosition::new(x, y)));
+    if let Ok(Some(mon)) = window.current_monitor() {
+        let ms = mon.scale_factor();
+        let mp = mon.position();
+        let sz = mon.size();
+        let left = mp.x as f64 / ms;
+        let top = mp.y as f64 / ms;
+        let right = left + sz.width as f64 / ms;
+        let bottom = top + sz.height as f64 / ms;
+        x = x.clamp(left + 4.0, right - panel_w - 4.0);
+        y = y.clamp(top + 4.0, bottom - panel_h - 4.0);
+    }
+
+    let _ = window.set_size(Size::Logical(LogicalSize::new(panel_w, panel_h)));
+    let _ = window.set_position(Position::Logical(LogicalPosition::new(x, y)));
 }
 
 fn setup_tray(app: &tauri::App) -> Result<(), String> {
@@ -1742,6 +1768,21 @@ pub fn run() {
             }
 
             setup_tray(app)?;
+
+            #[cfg(target_os = "macos")]
+            {
+                app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+                if let Some(win) = app.get_webview_window(MAIN_WINDOW_LABEL) {
+                    use window_vibrancy::{apply_vibrancy, NSVisualEffectMaterial, NSVisualEffectState};
+                    let _ = apply_vibrancy(
+                        &win,
+                        NSVisualEffectMaterial::HudWindow,
+                        Some(NSVisualEffectState::Active),
+                        Some(12.0),
+                    );
+                }
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

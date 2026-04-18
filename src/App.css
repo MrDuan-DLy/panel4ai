@@ -1,5 +1,6 @@
 :root {
-  font-family: -apple-system, "Segoe UI", "PingFang SC", sans-serif;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue",
+    "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
   color: #0b1220;
   background: transparent;
 }
@@ -20,10 +21,12 @@ body,
 .panel {
   width: 100%;
   height: 100%;
-  border-radius: 10px;
-  border: 1px solid #d2d8e5;
-  background: linear-gradient(180deg, #f9fbff 0%, #f1f5fb 100%);
-  box-shadow: 0 6px 18px rgba(15, 32, 66, 0.14);
+  border-radius: 12px;
+  border: 1px solid rgba(0, 0, 0, 0.08);
+  background: rgba(249, 251, 255, 0.72);
+  -webkit-backdrop-filter: saturate(180%) blur(24px);
+  backdrop-filter: saturate(180%) blur(24px);
+  box-shadow: 0 10px 30px rgba(15, 32, 66, 0.18);
   overflow: hidden;
 }
 
@@ -326,4 +329,59 @@ body,
   font-size: 11px;
   color: #7a1c1c;
   word-break: break-word;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    color: #e6ecf5;
+  }
+  .panel {
+    background: rgba(28, 30, 36, 0.72);
+    border-color: rgba(255, 255, 255, 0.08);
+  }
+  .card {
+    background: rgba(255, 255, 255, 0.05);
+    border-color: rgba(255, 255, 255, 0.08);
+  }
+  .card.muted,
+  .header p,
+  .provider-name,
+  .meta,
+  .status-row {
+    color: #9aa6bd;
+  }
+  .bar {
+    background: rgba(255, 255, 255, 0.08);
+  }
+  .ghost {
+    background: rgba(255, 255, 255, 0.06);
+    border-color: rgba(255, 255, 255, 0.12);
+    color: #cdd6e6;
+  }
+  .settings {
+    background: rgba(255, 255, 255, 0.03);
+    border-color: rgba(255, 255, 255, 0.08);
+  }
+  .settings input,
+  .settings select {
+    background: rgba(0, 0, 0, 0.25);
+    color: #e6ecf5;
+    border-color: rgba(255, 255, 255, 0.12);
+  }
+  .login-section {
+    background: rgba(255, 255, 255, 0.04);
+    border-color: rgba(255, 255, 255, 0.08);
+  }
+  .warning {
+    background: rgba(212, 179, 77, 0.12);
+  }
+  .error,
+  .card-error {
+    background: rgba(209, 67, 67, 0.12);
+  }
+  .card-error-msg,
+  .cached-msg,
+  .cached-badge {
+    color: #d6b45a;
+  }
 }
