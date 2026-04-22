@@ -396,7 +396,8 @@ fn panel_mouse_leave(app: AppHandle, state: State<'_, AppState>) {
         if state.hover_generation.load(Ordering::Relaxed) != gen {
             return;
         }
-        if state.panel_pinned.load(Ordering::Relaxed) || state.panel_hovered.load(Ordering::Relaxed) {
+        if state.panel_pinned.load(Ordering::Relaxed) || state.panel_hovered.load(Ordering::Relaxed)
+        {
             return;
         }
         if let Some(window) = handle.get_webview_window(MAIN_WINDOW_LABEL) {
@@ -458,6 +459,56 @@ fn update_tray_status(app: AppHandle, status: String) -> Result<(), String> {
     let icon = tauri::image::Image::from_bytes(icon_bytes).map_err(|e| e.to_string())?;
     tray.set_icon(Some(icon)).map_err(|e| e.to_string())?;
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn configure_macos_panel_window(window: &tauri::WebviewWindow) {
+    use objc2_app_kit::{NSStatusWindowLevel, NSWindow, NSWindowCollectionBehavior};
+
+    if let Err(err) = window.set_always_on_top(true) {
+        log::warn!("Failed to keep panel always on top: {err}");
+    }
+    if let Err(err) = window.set_visible_on_all_workspaces(true) {
+        log::warn!("Failed to show panel on all workspaces: {err}");
+    }
+
+    let window = window.clone();
+    let ns_window_owner = window.clone();
+    if let Err(err) = window.run_on_main_thread(move || unsafe {
+        let Ok(ns_window) = ns_window_owner.ns_window() else {
+            log::warn!("Failed to get NSWindow handle for panel");
+            return;
+        };
+
+        let ns_window: &NSWindow = &*ns_window.cast();
+        let mut collection_behavior = ns_window.collectionBehavior();
+        collection_behavior |= NSWindowCollectionBehavior::CanJoinAllSpaces;
+        collection_behavior |= NSWindowCollectionBehavior::FullScreenAuxiliary;
+        collection_behavior |= NSWindowCollectionBehavior::Transient;
+        ns_window.setCollectionBehavior(collection_behavior);
+        ns_window.setLevel(NSStatusWindowLevel);
+    }) {
+        log::warn!("Failed to configure macOS panel window on main thread: {err}");
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn order_macos_panel_front(window: &tauri::WebviewWindow) {
+    use objc2_app_kit::NSWindow;
+
+    let window = window.clone();
+    let ns_window_owner = window.clone();
+    if let Err(err) = window.run_on_main_thread(move || unsafe {
+        let Ok(ns_window) = ns_window_owner.ns_window() else {
+            log::warn!("Failed to get NSWindow handle for front ordering");
+            return;
+        };
+
+        let ns_window: &NSWindow = &*ns_window.cast();
+        ns_window.orderFrontRegardless();
+    }) {
+        log::warn!("Failed to bring macOS panel to front: {err}");
+    }
 }
 
 #[tauri::command]
@@ -738,7 +789,8 @@ async fn get_claude_usage_snapshot(
             }
         } else {
             return Err(
-                "Claude token expired and no refresh token. Please run `claude auth login`.".to_string(),
+                "Claude token expired and no refresh token. Please run `claude auth login`."
+                    .to_string(),
             );
         }
     }
@@ -965,7 +1017,10 @@ async fn fetch_claude_usage(
         .header("Authorization", format!("Bearer {access_token}"))
         .header("anthropic-beta", CLAUDE_OAUTH_BETA_HEADER)
         .header("Content-Type", "application/json")
-        .header("User-Agent", concat!("panel4ai/", env!("CARGO_PKG_VERSION")))
+        .header(
+            "User-Agent",
+            concat!("panel4ai/", env!("CARGO_PKG_VERSION")),
+        )
         .send()
         .await
         .map_err(|e| ApiFetchError::Http(e.to_string()))?;
@@ -1163,8 +1218,10 @@ fn resolve_claude_auth_source(settings: &AppSettings) -> Result<ClaudeAuthSource
         }
     }
 
-    Err("Claude OAuth tokens not found. Run `claude auth login` or set path in Settings."
-        .to_string())
+    Err(
+        "Claude OAuth tokens not found. Run `claude auth login` or set path in Settings."
+            .to_string(),
+    )
 }
 
 fn ensure_openai_auth_has_oauth_tokens(auth: &CodexAuthFile) -> Result<(), String> {
@@ -1414,17 +1471,24 @@ async fn start_openai_oauth(
         };
 
         // Check for error in callback
-        let callback_error = callback_url.query_pairs().find(|(k, _)| k == "error").map(|(_, err)| {
-            let desc = callback_url
+        let callback_error =
+            callback_url
                 .query_pairs()
-                .find(|(k, _)| k == "error_description")
-                .map(|(_, v)| v.to_string())
-                .unwrap_or_default();
-            format!("Authorization denied: {} {}", err, desc)
-        });
+                .find(|(k, _)| k == "error")
+                .map(|(_, err)| {
+                    let desc = callback_url
+                        .query_pairs()
+                        .find(|(k, _)| k == "error_description")
+                        .map(|(_, v)| v.to_string())
+                        .unwrap_or_default();
+                    format!("Authorization denied: {} {}", err, desc)
+                });
 
         // Validate state parameter
-        let cb_state = callback_url.query_pairs().find(|(k, _)| k == "state").map(|(_, v)| v.to_string());
+        let cb_state = callback_url
+            .query_pairs()
+            .find(|(k, _)| k == "state")
+            .map(|(_, v)| v.to_string());
         let state_valid = cb_state.as_deref() == Some(oauth_state.as_str());
 
         // Extract code
@@ -1679,6 +1743,8 @@ fn setup_tray(app: &tauri::App) -> Result<(), String> {
                         if !window.is_visible().unwrap_or(false) {
                             position_panel_near_tray(&window, &rect, PANEL_HEIGHT);
                             let _ = window.show();
+                            #[cfg(target_os = "macos")]
+                            order_macos_panel_front(&window);
                             // No set_focus — hover is just a preview
                         }
                     }
@@ -1696,7 +1762,9 @@ fn setup_tray(app: &tauri::App) -> Result<(), String> {
                         if state.hover_generation.load(Ordering::Relaxed) != gen {
                             return;
                         }
-                        if state.panel_pinned.load(Ordering::Relaxed) || state.panel_hovered.load(Ordering::Relaxed) {
+                        if state.panel_pinned.load(Ordering::Relaxed)
+                            || state.panel_hovered.load(Ordering::Relaxed)
+                        {
                             return;
                         }
                         if let Some(window) = handle.get_webview_window(MAIN_WINDOW_LABEL) {
@@ -1722,6 +1790,8 @@ fn setup_tray(app: &tauri::App) -> Result<(), String> {
                             if !window.is_visible().unwrap_or(false) {
                                 position_panel_near_tray(&window, &rect, PANEL_HEIGHT);
                                 let _ = window.show();
+                                #[cfg(target_os = "macos")]
+                                order_macos_panel_front(&window);
                             }
                             let _ = window.set_focus();
                         }
@@ -1773,7 +1843,10 @@ pub fn run() {
             {
                 app.set_activation_policy(tauri::ActivationPolicy::Accessory);
                 if let Some(win) = app.get_webview_window(MAIN_WINDOW_LABEL) {
-                    use window_vibrancy::{apply_vibrancy, NSVisualEffectMaterial, NSVisualEffectState};
+                    use window_vibrancy::{
+                        apply_vibrancy, NSVisualEffectMaterial, NSVisualEffectState,
+                    };
+                    configure_macos_panel_window(&win);
                     let _ = apply_vibrancy(
                         &win,
                         NSVisualEffectMaterial::HudWindow,
@@ -2014,14 +2087,18 @@ mod tests {
 
     #[test]
     fn api_fetch_error_rate_limited_with_retry() {
-        let err = ApiFetchError::RateLimited { retry_after_secs: Some(60) };
+        let err = ApiFetchError::RateLimited {
+            retry_after_secs: Some(60),
+        };
         let msg = err.message();
         assert!(msg.contains("60s"));
     }
 
     #[test]
     fn api_fetch_error_rate_limited_without_retry() {
-        let err = ApiFetchError::RateLimited { retry_after_secs: None };
+        let err = ApiFetchError::RateLimited {
+            retry_after_secs: None,
+        };
         let msg = err.message();
         assert!(msg.contains("429"));
     }

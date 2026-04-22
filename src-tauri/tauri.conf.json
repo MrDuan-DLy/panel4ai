@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "panel4ai",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "identifier": "ai.panel4.desktop",
   "build": {
     "frontendDist": "../dist",
@@ -21,6 +21,7 @@
         "fullscreen": false,
         "decorations": false,
         "alwaysOnTop": true,
+        "visibleOnAllWorkspaces": true,
         "skipTaskbar": true,
         "visible": false,
         "transparent": true,
