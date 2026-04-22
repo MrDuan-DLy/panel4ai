@@ -1714,6 +1714,25 @@ fn position_panel_near_tray(window: &tauri::WebviewWindow, tray_rect: &tauri::Re
     let _ = window.set_position(Position::Logical(LogicalPosition::new(x, y)));
 }
 
+fn show_panel_preview(app: &AppHandle, rect: &tauri::Rect) {
+    let state = app.state::<AppState>();
+    state.hover_generation.fetch_add(1, Ordering::Relaxed);
+
+    if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
+        let pinned = state.panel_pinned.load(Ordering::Relaxed);
+        if !pinned {
+            position_panel_near_tray(&window, rect, PANEL_HEIGHT);
+        }
+        if !window.is_visible().unwrap_or(false) {
+            let _ = window.show();
+        }
+        #[cfg(target_os = "macos")]
+        if !pinned {
+            order_macos_panel_front(&window);
+        }
+    }
+}
+
 fn setup_tray(app: &tauri::App) -> Result<(), String> {
     let quit =
         MenuItem::with_id(app, "quit", "Quit", true, None::<&str>).map_err(|e| e.to_string())?;
@@ -1736,18 +1755,9 @@ fn setup_tray(app: &tauri::App) -> Result<(), String> {
         .on_tray_icon_event(|tray, event| {
             let app = tray.app_handle();
             match event {
-                TrayIconEvent::Enter { rect, .. } => {
-                    let state = app.state::<AppState>();
-                    state.hover_generation.fetch_add(1, Ordering::Relaxed);
-                    if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
-                        if !window.is_visible().unwrap_or(false) {
-                            position_panel_near_tray(&window, &rect, PANEL_HEIGHT);
-                            let _ = window.show();
-                            #[cfg(target_os = "macos")]
-                            order_macos_panel_front(&window);
-                            // No set_focus — hover is just a preview
-                        }
-                    }
+                TrayIconEvent::Enter { rect, .. } | TrayIconEvent::Move { rect, .. } => {
+                    show_panel_preview(&app, &rect);
+                    // No set_focus — hover is just a preview
                 }
                 TrayIconEvent::Leave { .. } => {
                     let state = app.state::<AppState>();
