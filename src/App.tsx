@@ -410,7 +410,7 @@ function App() {
 
             <div className="status-row">
               {loading ? 'Refreshing...' : `Updated: ${lastUpdated}`}
-              <span className="version-tag">v0.1.7</span>
+              <span className="version-tag">v0.1.8</span>
             </div>
 
             {!oauthStatus.available && (
