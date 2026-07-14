@@ -1,4 +1,6 @@
 use chrono::Utc;
+use panel4ai_core::SnapshotEnvelope;
+pub use panel4ai_core::UsageSnapshot;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -32,22 +34,6 @@ const CLAUDE_OAUTH_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const CLAUDE_OAUTH_REDIRECT_URI: &str = "https://platform.claude.com/oauth/code/callback";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UsageSnapshot {
-    provider: String,
-    window_type: String,
-    window_start: i64,
-    window_end: i64,
-    used: f64,
-    limit: f64,
-    remaining_percent: f64,
-    reset_at: i64,
-    updated_at: i64,
-    status: String,
-    message: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct AppSettings {
     provider: String,
@@ -59,6 +45,9 @@ pub struct AppSettings {
     selected_window_type: String,
     codex_auth_path: String,
     claude_auth_path: String,
+    data_source: String,
+    server_url: String,
+    server_api_token: String,
     limits_by_window: HashMap<String, f64>,
 }
 
@@ -78,6 +67,9 @@ impl Default for AppSettings {
             selected_window_type: "hourly5".to_string(),
             codex_auth_path: "".to_string(),
             claude_auth_path: "".to_string(),
+            data_source: "remote_fallback".to_string(),
+            server_url: "http://127.0.0.1:8787".to_string(),
+            server_api_token: "".to_string(),
             limits_by_window,
         }
     }
@@ -319,11 +311,17 @@ fn get_oauth_status(state: State<'_, AppState>) -> OAuthStatus {
         .lock()
         .expect("settings mutex poisoned")
         .clone();
+    let remote_ok = settings.data_source != "local"
+        && !settings.server_url.trim().is_empty()
+        && !settings.server_api_token.trim().is_empty();
     let openai_ok = resolve_openai_auth_source(&settings).is_ok();
     let claude_ok = resolve_claude_auth_source(&settings).is_ok();
 
-    if openai_ok || claude_ok {
+    if remote_ok || openai_ok || claude_ok {
         let mut sources = Vec::new();
+        if remote_ok {
+            sources.push("VPS");
+        }
         if openai_ok {
             sources.push("OpenAI");
         }
@@ -333,7 +331,7 @@ fn get_oauth_status(state: State<'_, AppState>) -> OAuthStatus {
         OAuthStatus {
             available: true,
             source: sources.join(", "),
-            message: Some("OAuth token(s) loaded".to_string()),
+            message: Some("Data source configured".to_string()),
         }
     } else {
         OAuthStatus {
@@ -570,6 +568,14 @@ async fn get_all_usage_snapshots(state: State<'_, AppState>) -> Result<Vec<Usage
         (s, c)
     };
 
+    if settings.data_source == "remote" || settings.data_source == "remote_fallback" {
+        match fetch_remote_usage(&settings, &client).await {
+            Ok(snapshots) => return Ok(select_remote_snapshots(&settings, snapshots)),
+            Err(error) if settings.data_source == "remote" => return Err(error),
+            Err(error) => log::warn!("VPS usage fetch failed, using local fallback: {error}"),
+        }
+    }
+
     let openai_available = resolve_openai_auth_source(&settings).is_ok();
     let claude_available = resolve_claude_auth_source(&settings).is_ok();
 
@@ -612,6 +618,131 @@ async fn get_all_usage_snapshots(state: State<'_, AppState>) -> Result<Vec<Usage
     }
 
     Ok(snapshots)
+}
+
+async fn fetch_remote_usage(
+    settings: &AppSettings,
+    client: &reqwest::Client,
+) -> Result<Vec<UsageSnapshot>, String> {
+    if settings.server_api_token.trim().is_empty() {
+        return Err("VPS API token is not configured".to_string());
+    }
+    let base = panel4ai_core::normalize_server_url(&settings.server_url)?;
+    let url = base
+        .join("api/v1/snapshots")
+        .map_err(|error| error.to_string())?;
+    let response = client
+        .get(url)
+        .bearer_auth(settings.server_api_token.trim())
+        .send()
+        .await
+        .map_err(|error| format!("VPS request failed: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!("VPS returned HTTP {}", response.status()));
+    }
+    let envelope = response
+        .json::<SnapshotEnvelope>()
+        .await
+        .map_err(|error| format!("Invalid VPS response: {error}"))?;
+    let mut snapshots = envelope.snapshots;
+    for (provider, error) in envelope.provider_errors {
+        let has_provider = snapshots.iter().any(|snapshot| {
+            if provider == "openai" {
+                snapshot.provider.starts_with("openai")
+            } else {
+                snapshot.provider.starts_with("claude")
+            }
+        });
+        if !has_provider {
+            snapshots.push(error_snapshot(&format!("{provider}-vps"), error));
+        }
+    }
+    Ok(snapshots)
+}
+
+fn select_remote_snapshots(
+    settings: &AppSettings,
+    snapshots: Vec<UsageSnapshot>,
+) -> Vec<UsageSnapshot> {
+    let selected = settings.selected_window_type.as_str();
+    let mut groups: HashMap<&str, Vec<UsageSnapshot>> = HashMap::new();
+    for snapshot in snapshots {
+        let key = if snapshot.provider.starts_with("openai") {
+            "openai"
+        } else if snapshot.provider.starts_with("claude") {
+            "claude"
+        } else {
+            "other"
+        };
+        groups.entry(key).or_default().push(snapshot);
+    }
+    let mut result = Vec::new();
+    for (_, mut group) in groups {
+        if let Some(position) = group.iter().position(|snapshot| snapshot.status == "error") {
+            if group.len() == 1 {
+                result.push(group.remove(position));
+                continue;
+            }
+        }
+        let position = group
+            .iter()
+            .position(|snapshot| snapshot.window_type == selected)
+            .or_else(|| {
+                group
+                    .iter()
+                    .position(|snapshot| snapshot.window_type == "weekly")
+            })
+            .or_else(|| {
+                group
+                    .iter()
+                    .position(|snapshot| snapshot.window_type == "hourly5")
+            });
+        if let Some(position) = position {
+            result.push(group.remove(position));
+        }
+    }
+    result.sort_by(|left, right| left.provider.cmp(&right.provider));
+    result
+}
+
+#[tauri::command]
+async fn send_test_email(state: State<'_, AppState>) -> Result<String, String> {
+    let (settings, client) = {
+        let settings = state
+            .settings
+            .lock()
+            .expect("settings mutex poisoned")
+            .clone();
+        (settings, state.http_client.clone())
+    };
+    if settings.server_api_token.trim().is_empty() {
+        return Err("VPS API token is not configured".to_string());
+    }
+    let base = panel4ai_core::normalize_server_url(&settings.server_url)?;
+    let url = base
+        .join("api/v1/test-email")
+        .map_err(|error| error.to_string())?;
+    let response = client
+        .post(url)
+        .bearer_auth(settings.server_api_token.trim())
+        .send()
+        .await
+        .map_err(|error| format!("VPS request failed: {error}"))?;
+    let status = response.status();
+    let payload: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|error| format!("Invalid VPS response: {error}"))?;
+    let message = payload
+        .get("message")
+        .and_then(|value| value.as_str())
+        .unwrap_or("No response message")
+        .to_string();
+    if status.is_success() {
+        Ok(message)
+    } else {
+        Err(message)
+    }
 }
 
 async fn get_openai_usage_snapshot(
@@ -672,19 +803,33 @@ fn wham_to_snapshot(
 ) -> Result<UsageSnapshot, String> {
     let selected = settings.selected_window_type.as_str();
 
+    let rate_windows = usage
+        .rate_limit
+        .as_ref()
+        .into_iter()
+        .flat_map(|rate_limit| {
+            [
+                ("hourly5", rate_limit.primary_window.clone()),
+                ("weekly", rate_limit.secondary_window.clone()),
+            ]
+        })
+        .filter_map(|(fallback, window)| {
+            window.map(|window| {
+                let kind =
+                    panel4ai_core::classify_openai_window(window.limit_window_seconds, fallback);
+                (kind, window)
+            })
+        })
+        .collect::<Vec<_>>();
+
     let (window_type, window) = match selected {
         "hourly5" => (
             "hourly5".to_string(),
-            usage
-                .rate_limit
-                .as_ref()
-                .and_then(|r| r.primary_window.clone())
-                .or_else(|| {
-                    usage
-                        .rate_limit
-                        .as_ref()
-                        .and_then(|r| r.secondary_window.clone())
-                }),
+            rate_windows
+                .iter()
+                .find(|(kind, _)| kind == "hourly5")
+                .or_else(|| rate_windows.first())
+                .map(|(_, window)| window.clone()),
         ),
         "code_review_weekly" => (
             "code_review_weekly".to_string(),
@@ -693,30 +838,25 @@ fn wham_to_snapshot(
                 .as_ref()
                 .and_then(|r| r.primary_window.clone())
                 .or_else(|| {
-                    usage
-                        .rate_limit
-                        .as_ref()
-                        .and_then(|r| r.secondary_window.clone())
+                    rate_windows
+                        .iter()
+                        .find(|(kind, _)| kind == "weekly")
+                        .map(|(_, window)| window.clone())
                 }),
         ),
         _ => (
             "weekly".to_string(),
-            usage
-                .rate_limit
-                .as_ref()
-                .and_then(|r| r.secondary_window.clone())
-                .or_else(|| {
-                    usage
-                        .rate_limit
-                        .as_ref()
-                        .and_then(|r| r.primary_window.clone())
-                }),
+            rate_windows
+                .iter()
+                .find(|(kind, _)| kind == "weekly")
+                .or_else(|| rate_windows.first())
+                .map(|(_, window)| window.clone()),
         ),
     };
 
     let window = window.ok_or_else(|| "No usage window found in OAuth response".to_string())?;
     let used_percent = window.used_percent.unwrap_or(0.0).clamp(0.0, 100.0);
-    let reset_at = window.reset_at.unwrap_or_else(|| Utc::now().timestamp());
+    let reset_at = window.reset_at.unwrap_or(0);
     let window_seconds = window
         .limit_window_seconds
         .unwrap_or(match window_type.as_str() {
@@ -735,7 +875,11 @@ fn wham_to_snapshot(
     Ok(UsageSnapshot {
         provider,
         window_type,
-        window_start: reset_at - window_seconds,
+        window_start: if reset_at > 0 {
+            reset_at - window_seconds
+        } else {
+            0
+        },
         window_end: reset_at,
         used: used_percent,
         limit: 100.0,
@@ -816,12 +960,12 @@ async fn get_claude_usage_snapshot(
     // First attempt
     let first_result = fetch_claude_usage(client, &tokens.access_token).await;
 
-    // Handle errors: for both 429 (rate limited) and 401 (unauthorized), try refreshing
-    // the token first. The /api/oauth/usage rate limit is per-access-token, so a fresh
-    // token gets a new rate limit window (see anthropics/claude-code#30930).
+    // Refresh only on authentication failure. A 429 must honor Retry-After; refreshing
+    // a token to bypass an endpoint rate limit creates token churn and can invalidate
+    // another Claude Code session.
     let usage = match first_result {
         Ok(usage) => usage,
-        Err(ApiFetchError::RateLimited { .. }) | Err(ApiFetchError::Unauthorized) => {
+        Err(ApiFetchError::Unauthorized) => {
             let refresh_token = tokens
                 .refresh_token
                 .clone()
@@ -829,7 +973,7 @@ async fn get_claude_usage_snapshot(
 
             match refresh_claude_oauth_token(client, &refresh_token).await {
                 Ok(refreshed) => {
-                    log::info!("Claude usage 429/401 — refreshed token for new rate limit window");
+                    log::info!("Claude usage unauthorized — refreshed OAuth token");
                     apply_claude_refresh(&mut tokens, refreshed);
                     source.auth.claude_ai_oauth = Some(tokens.clone());
                     if let Some(path) = source.path.as_ref() {
@@ -840,7 +984,9 @@ async fn get_claude_usage_snapshot(
                         .map_err(ApiFetchError::message)?
                 }
                 Err(refresh_err) => {
-                    log::warn!("Claude token refresh failed after 429/401: {refresh_err}");
+                    log::warn!(
+                        "Claude token refresh failed after unauthorized response: {refresh_err}"
+                    );
                     return Err(first_result.unwrap_err().message());
                 }
             }
@@ -883,8 +1029,9 @@ fn claude_to_snapshot(
         "hourly5" => 18_000,
         _ => 604_800,
     };
-    let reset_at = parse_reset_epoch(window.resets_at.as_ref())
-        .unwrap_or_else(|| Utc::now().timestamp() + window_seconds);
+    // Unknown reset times stay unknown (0). They may be displayed as unavailable, but
+    // must never be used to generate a confirmed reset notification.
+    let reset_at = parse_reset_epoch(window.resets_at.as_ref()).unwrap_or(0);
     let remaining_percent = (100.0 - used_percent).clamp(0.0, 100.0);
     let status = compute_status(remaining_percent, settings.alert_threshold_percent).to_string();
 
@@ -930,7 +1077,11 @@ fn claude_to_snapshot(
     Ok(UsageSnapshot {
         provider,
         window_type,
-        window_start: reset_at - window_seconds,
+        window_start: if reset_at > 0 {
+            reset_at - window_seconds
+        } else {
+            0
+        },
         window_end: reset_at,
         used: used_percent,
         limit: 100.0,
@@ -1369,7 +1520,9 @@ fn settings_path(app: &AppHandle) -> Result<PathBuf, String> {
 fn persist_settings(app: &AppHandle, settings: &AppSettings) -> Result<(), String> {
     let path = settings_path(app)?;
     let content = serde_json::to_string_pretty(settings).map_err(|e| e.to_string())?;
-    fs::write(path, content).map_err(|e| e.to_string())
+    fs::write(&path, content).map_err(|e| e.to_string())?;
+    set_file_permissions_600(&path);
+    Ok(())
 }
 
 fn load_settings(app: &AppHandle) -> AppSettings {
@@ -1390,6 +1543,15 @@ fn load_settings(app: &AppHandle) -> AppSettings {
 
 fn normalize_settings(settings: &mut AppSettings) {
     settings.collapse_delay_ms = 0;
+    settings.refresh_interval_sec = settings.refresh_interval_sec.max(15);
+    settings.alert_threshold_percent = settings.alert_threshold_percent.clamp(1.0, 99.0);
+    if !matches!(
+        settings.data_source.as_str(),
+        "remote" | "local" | "remote_fallback"
+    ) {
+        settings.data_source = "remote_fallback".to_string();
+    }
+    settings.server_url = settings.server_url.trim().trim_end_matches('/').to_string();
 }
 
 #[tauri::command]
@@ -1880,6 +2042,7 @@ pub fn run() {
             resize_panel,
             update_tray_status,
             notify_if_needed,
+            send_test_email,
             open_external_url,
             start_openai_oauth,
             exchange_claude_auth_code

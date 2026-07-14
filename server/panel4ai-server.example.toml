@@ -1,0 +1,11 @@
+bind_addr = "127.0.0.1:8787"
+database_path = "/var/lib/panel4ai/panel4ai.sqlite3"
+codex_auth_path = "/var/lib/panel4ai/codex-home/auth.json"
+claude_auth_path = "/var/lib/panel4ai/.claude/.credentials.json"
+api_token_file = "/etc/panel4ai/api-token"
+postmark_token_file = "/etc/panel4ai/postmark-token"
+postmark_from = "Panel4AI <quota@example.com>"
+postmark_to = "you@example.com"
+postmark_message_stream = "outbound"
+poll_interval_sec = 300
+alert_threshold_percent = 20.0

@@ -34,6 +34,8 @@ dist-ssr
 
 # Tauri build output
 src-tauri/target/
+/target/
+/artifacts/
 
 # OS files
 Thumbs.db

@@ -261,6 +261,19 @@ body,
   font-size: 12px;
 }
 
+.settings .secondary-btn {
+  background: #eef3ff;
+  border-color: #b4c0da;
+  color: #223c6d;
+}
+
+.settings-status {
+  margin: -2px 0 0;
+  color: #4c5f82;
+  font-size: 11px;
+  word-break: break-word;
+}
+
 .checkbox {
   flex-direction: row;
   align-items: center;

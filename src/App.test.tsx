@@ -29,6 +29,9 @@ const defaultSettings: AppSettings = {
   selectedWindowType: 'hourly5',
   codexAuthPath: '',
   claudeAuthPath: '',
+  dataSource: 'remote_fallback',
+  serverUrl: 'http://127.0.0.1:8787',
+  serverApiToken: 'test-token',
   limitsByWindow: { hourly5: 100, weekly: 100 },
 }
 
