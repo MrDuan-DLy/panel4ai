@@ -41,8 +41,8 @@ jobs:
       - name: Frontend tests
         run: npm run test
 
-      - name: Rust check
-        run: cargo check --manifest-path src-tauri/Cargo.toml
+      - name: Production build check
+        run: npm run tauri build -- --no-bundle
 
       - name: Rust tests
         run: cargo test --manifest-path src-tauri/Cargo.toml
