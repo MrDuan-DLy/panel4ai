@@ -1,0 +1,7 @@
+[workspace]
+members = [
+  "crates/panel4ai-core",
+  "server",
+  "src-tauri",
+]
+resolver = "2"

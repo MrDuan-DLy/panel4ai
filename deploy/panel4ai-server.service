@@ -1,0 +1,27 @@
+[Unit]
+Description=Panel4AI quota monitor and email notifier
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=panel4ai
+Group=panel4ai
+ExecStart=/usr/local/bin/panel4ai-server
+Environment=PANEL4AI_CONFIG=/etc/panel4ai/server.toml
+Environment=RUST_LOG=panel4ai_server=info
+Restart=on-failure
+RestartSec=10s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/panel4ai
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

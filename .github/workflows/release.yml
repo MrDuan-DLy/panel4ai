@@ -30,7 +30,7 @@ jobs:
       - name: Rust cache
         uses: swatinem/rust-cache@v2
         with:
-          workspaces: src-tauri
+          workspaces: .
 
       - name: Install frontend dependencies
         run: npm ci
@@ -59,5 +59,46 @@ jobs:
 
             ### Windows
             Run the `.msi` or `.exe` installer. You may need to click "More info" → "Run anyway" on SmartScreen the first time.
+
+            ### Linux VPS
+            Download `panel4ai-server-*-linux-x86_64-musl` for a static x86_64 server binary. Verify it with the adjacent `.sha256` file, then follow the repository deployment guide.
           releaseDraft: false
           prerelease: false
+
+  build-server:
+    needs: build-and-release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable with musl target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: .
+
+      - name: Build static VPS server
+        run: cargo build --locked --release -p panel4ai-server --target x86_64-unknown-linux-musl
+
+      - name: Prepare release assets
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          asset="panel4ai-server-${version}-linux-x86_64-musl"
+          install -m 0755 target/x86_64-unknown-linux-musl/release/panel4ai-server "${asset}"
+          sha256sum "${asset}" > "${asset}.sha256"
+
+      - name: Upload VPS server assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          asset="panel4ai-server-${version}-linux-x86_64-musl"
+          gh release upload "${GITHUB_REF_NAME}" "${asset}" "${asset}.sha256" --clobber

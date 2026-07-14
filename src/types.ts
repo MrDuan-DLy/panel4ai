@@ -22,6 +22,9 @@ export type AppSettings = {
   selectedWindowType: 'hourly5' | 'weekly' | 'code_review_weekly' | string
   codexAuthPath: string
   claudeAuthPath: string
+  dataSource: 'remote' | 'local' | 'remote_fallback' | string
+  serverUrl: string
+  serverApiToken: string
   limitsByWindow: Record<string, number>
 }
 

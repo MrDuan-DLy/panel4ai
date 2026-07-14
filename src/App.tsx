@@ -18,6 +18,9 @@ const defaultSettings: AppSettings = {
   selectedWindowType: 'hourly5',
   codexAuthPath: '',
   claudeAuthPath: '',
+  dataSource: 'remote_fallback',
+  serverUrl: 'http://127.0.0.1:8787',
+  serverApiToken: '',
   limitsByWindow: {
     weekly: 100,
     hourly5: 100,
@@ -31,6 +34,7 @@ const defaultOAuthStatus: OAuthStatus = {
 }
 
 function fmtTime(epochSec: number): string {
+  if (epochSec <= 0) return 'Unknown'
   return new Date(epochSec * 1000).toLocaleString()
 }
 
@@ -69,6 +73,7 @@ function App() {
   const snapshotsRef = useRef<UsageSnapshot[]>([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
+  const [testEmailStatus, setTestEmailStatus] = useState('')
 
   // Claude OAuth login state
   const [claudeLoginStep, setClaudeLoginStep] = useState<'idle' | 'waiting' | 'exchanging' | 'success'>('idle')
@@ -228,6 +233,16 @@ function App() {
       await refresh()
     } catch (e) {
       setError(String(e))
+    }
+  }
+
+  const sendTestEmail = async () => {
+    try {
+      setTestEmailStatus('Sending...')
+      const message = await invoke<string>('send_test_email')
+      setTestEmailStatus(message)
+    } catch (e) {
+      setTestEmailStatus(String(e))
     }
   }
 
@@ -410,7 +425,7 @@ function App() {
 
             <div className="status-row">
               {loading ? 'Refreshing...' : `Updated: ${lastUpdated}`}
-              <span className="version-tag">v0.1.8</span>
+              <span className="version-tag">v0.1.9</span>
             </div>
 
             {!oauthStatus.available && (
@@ -427,6 +442,44 @@ function App() {
 
         {settingsOpen && (
           <div className="settings">
+            <label>
+              Data source
+              <select
+                value={settings.dataSource}
+                onChange={(e) => setSettings({ ...settings, dataSource: e.target.value })}
+              >
+                <option value="remote">VPS only</option>
+                <option value="remote_fallback">VPS with local fallback</option>
+                <option value="local">Local OAuth only</option>
+              </select>
+            </label>
+            {settings.dataSource !== 'local' && (
+              <>
+                <label>
+                  VPS URL
+                  <input
+                    type="text"
+                    value={settings.serverUrl}
+                    onChange={(e) => setSettings({ ...settings, serverUrl: e.target.value })}
+                    placeholder="http://100.x.y.z:8787"
+                  />
+                </label>
+                <label>
+                  VPS access token
+                  <input
+                    type="password"
+                    value={settings.serverApiToken}
+                    onChange={(e) => setSettings({ ...settings, serverApiToken: e.target.value })}
+                    placeholder="Stored only in the local app config"
+                    autoComplete="off"
+                  />
+                </label>
+                <button type="button" className="secondary-btn" onClick={() => void sendTestEmail()}>
+                  Send test email
+                </button>
+                {testEmailStatus && <p className="settings-status">{testEmailStatus}</p>}
+              </>
+            )}
             <label>
               Codex auth path (optional)
               <input
