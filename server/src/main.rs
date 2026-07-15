@@ -112,7 +112,7 @@ struct PostmarkResponse {
     error_code: i64,
     #[serde(default)]
     message: String,
-    #[serde(default)]
+    #[serde(default, rename = "MessageID")]
     message_id: String,
 }
 
@@ -408,7 +408,13 @@ fn persist_snapshot(
         .map_err(|error| error.to_string())?;
 
     if let Some((old_reset_at, previous_remaining)) = previous {
-        if old_reset_at > 0 && snapshot.reset_at > old_reset_at + 60 {
+        if let Some(reason) = confirmed_reset_reason(
+            old_reset_at,
+            snapshot.reset_at,
+            previous_remaining,
+            snapshot.remaining_percent,
+            now,
+        ) {
             let event_id = reset_event_id(provider_key, &snapshot.window_type, old_reset_at);
             let inserted = transaction
                 .execute(
@@ -439,12 +445,37 @@ fn persist_snapshot(
                     window = snapshot.window_type,
                     old_reset_at,
                     new_reset_at = snapshot.reset_at,
+                    reason,
                     "confirmed quota reset"
                 );
             }
         }
     }
     transaction.commit().map_err(|error| error.to_string())
+}
+
+fn confirmed_reset_reason(
+    old_reset_at: i64,
+    new_reset_at: i64,
+    previous_remaining: f64,
+    current_remaining: f64,
+    observed_at: i64,
+) -> Option<&'static str> {
+    // Do not treat provider schedule corrections as resets before the old boundary.
+    // A small allowance covers clock skew between the provider and this host.
+    if old_reset_at <= 0 || observed_at < old_reset_at.saturating_sub(120) {
+        return None;
+    }
+    if new_reset_at > old_reset_at + 60 {
+        return Some("next_reset_advanced");
+    }
+    // Claude omits `resets_at` after a completed window becomes idle. Confirm that
+    // transition only when the old boundary was reached and quota actually returned
+    // to effectively 100%, so a transient missing field cannot create an email.
+    if new_reset_at == 0 && previous_remaining < 99.5 && current_remaining >= 99.5 {
+        return Some("window_completed_idle");
+    }
+    None
 }
 
 fn reset_event_id(provider: &str, window_type: &str, old_reset_at: i64) -> String {
@@ -514,7 +545,7 @@ async fn send_reset_email(state: &Arc<AppState>, item: &OutboxItem) -> Result<St
         .as_deref()
         .ok_or_else(|| "Postmark token is not configured".to_string())?;
     let old_local = format_timestamp(item.old_reset_at);
-    let new_local = format_timestamp(item.new_reset_at);
+    let new_local = format_next_reset(item.new_reset_at);
     let provider_name = if item.provider.starts_with("openai") {
         "Codex"
     } else if item.provider.starts_with("claude") {
@@ -632,6 +663,14 @@ fn format_timestamp(epoch: i64) -> String {
         utc.with_timezone(&London).format("%Y-%m-%d %H:%M:%S %Z"),
         utc.format("%Y-%m-%d %H:%M:%S")
     )
+}
+
+fn format_next_reset(epoch: i64) -> String {
+    if epoch <= 0 {
+        "未安排（当前额度窗口空闲）".to_string()
+    } else {
+        format_timestamp(epoch)
+    }
 }
 
 async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -826,9 +865,47 @@ mod tests {
     }
 
     #[test]
+    fn confirms_reset_when_next_boundary_advances_after_old_boundary() {
+        assert_eq!(
+            confirmed_reset_reason(1_000, 2_000, 20.0, 99.0, 1_001),
+            Some("next_reset_advanced")
+        );
+    }
+
+    #[test]
+    fn confirms_claude_reset_when_completed_window_becomes_idle() {
+        assert_eq!(
+            confirmed_reset_reason(1_000, 0, 12.5, 100.0, 1_001),
+            Some("window_completed_idle")
+        );
+    }
+
+    #[test]
+    fn does_not_confirm_idle_transition_before_boundary() {
+        assert_eq!(confirmed_reset_reason(2_000, 0, 12.5, 100.0, 1_000), None);
+    }
+
+    #[test]
+    fn does_not_confirm_missing_reset_without_quota_recovery() {
+        assert_eq!(confirmed_reset_reason(1_000, 0, 12.5, 12.5, 1_001), None);
+        assert_eq!(confirmed_reset_reason(1_000, 0, 100.0, 100.0, 1_001), None);
+    }
+
+    #[test]
     fn secret_comparison_checks_all_bytes() {
         let expected = sha256(b"expected");
         assert!(constant_time_eq(&expected, &sha256(b"expected")));
         assert!(!constant_time_eq(&expected, &sha256(b"different")));
+    }
+
+    #[test]
+    fn parses_postmark_message_id() {
+        let response: PostmarkResponse = serde_json::from_value(serde_json::json!({
+            "ErrorCode": 0,
+            "Message": "OK",
+            "MessageID": "message-id"
+        }))
+        .expect("valid Postmark response");
+        assert_eq!(response.message_id, "message-id");
     }
 }
