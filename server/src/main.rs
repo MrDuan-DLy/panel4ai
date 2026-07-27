@@ -6,7 +6,7 @@ use axum::{Json, Router};
 use chrono::{TimeZone, Utc};
 use chrono_tz::Europe::London;
 use panel4ai_core::{ProviderError, ProviderPaths, QuotaClient, SnapshotEnvelope, UsageSnapshot};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -16,10 +16,13 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex as AsyncMutex, RwLock};
 use tracing::{error, info, warn};
 
 const DEFAULT_CONFIG_PATH: &str = "/etc/panel4ai/server.toml";
+const SNAPSHOT_HISTORY_RETENTION_SECS: i64 = 30 * 24 * 60 * 60;
+const RESET_RECOVERY_MIN_POINTS: f64 = 3.0;
+const RESET_CONFIRMATION_MIN_POINTS: f64 = 1.5;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -27,6 +30,8 @@ struct Config {
     bind_addr: String,
     database_path: PathBuf,
     codex_auth_path: PathBuf,
+    codex_binary_path: PathBuf,
+    codex_use_app_server: bool,
     claude_auth_path: PathBuf,
     api_token_file: PathBuf,
     postmark_token_file: PathBuf,
@@ -43,6 +48,8 @@ impl Default for Config {
             bind_addr: "127.0.0.1:8787".to_string(),
             database_path: "/var/lib/panel4ai/panel4ai.sqlite3".into(),
             codex_auth_path: "/var/lib/panel4ai/auth/codex.json".into(),
+            codex_binary_path: "/var/lib/panel4ai/.local/bin/codex".into(),
+            codex_use_app_server: true,
             claude_auth_path: "/var/lib/panel4ai/auth/claude.json".into(),
             api_token_file: "/etc/panel4ai/api-token".into(),
             postmark_token_file: "/etc/panel4ai/postmark-token".into(),
@@ -72,6 +79,7 @@ struct AppState {
     postmark_token: Option<String>,
     api_token_hash: [u8; 32],
     runtime: RwLock<RuntimeStatus>,
+    poll_lock: AsyncMutex<()>,
 }
 
 #[derive(Debug, Serialize)]
@@ -102,7 +110,19 @@ struct OutboxItem {
     old_reset_at: i64,
     new_reset_at: i64,
     previous_remaining: f64,
+    current_remaining: f64,
+    event_kind: String,
+    reason: String,
+    detail: Option<String>,
     attempts: i64,
+}
+
+#[derive(Debug)]
+struct ResetCandidate {
+    baseline_remaining: f64,
+    candidate_remaining: f64,
+    old_reset_at: i64,
+    first_observed_at: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -137,6 +157,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let quota = QuotaClient::new(
         ProviderPaths {
             codex_auth_path: config.codex_auth_path.clone(),
+            codex_binary_path: config
+                .codex_use_app_server
+                .then(|| config.codex_binary_path.clone()),
             claude_auth_path: config.claude_auth_path.clone(),
         },
         config.alert_threshold_percent,
@@ -156,6 +179,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             started_at: Utc::now().timestamp(),
             ..RuntimeStatus::default()
         }),
+        poll_lock: AsyncMutex::new(()),
     });
 
     let poll_state = Arc::clone(&state);
@@ -235,6 +259,10 @@ fn initialize_database(connection: &Connection) -> rusqlite::Result<()> {
             old_reset_at INTEGER NOT NULL,
             new_reset_at INTEGER NOT NULL,
             previous_remaining REAL NOT NULL,
+            current_remaining REAL NOT NULL DEFAULT 100,
+            event_kind TEXT NOT NULL DEFAULT 'quota_reset',
+            reason TEXT NOT NULL DEFAULT 'legacy',
+            detail TEXT,
             created_at INTEGER NOT NULL
         );
         CREATE TABLE IF NOT EXISTS email_outbox (
@@ -248,8 +276,78 @@ fn initialize_database(connection: &Connection) -> rusqlite::Result<()> {
         );
         CREATE INDEX IF NOT EXISTS email_outbox_pending
             ON email_outbox(sent_at, next_attempt_at);
+        CREATE TABLE IF NOT EXISTS snapshot_observations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            provider_key TEXT NOT NULL,
+            window_type TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            reset_at INTEGER NOT NULL,
+            observed_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS snapshot_observations_lookup
+            ON snapshot_observations(provider_key, window_type, observed_at);
+        CREATE TABLE IF NOT EXISTS reset_candidates (
+            provider_key TEXT NOT NULL,
+            window_type TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            baseline_remaining REAL NOT NULL,
+            candidate_remaining REAL NOT NULL,
+            old_reset_at INTEGER NOT NULL,
+            new_reset_at INTEGER NOT NULL,
+            first_observed_at INTEGER NOT NULL,
+            last_observed_at INTEGER NOT NULL,
+            confirmations INTEGER NOT NULL DEFAULT 1,
+            PRIMARY KEY(provider_key, window_type)
+        );
+        CREATE TABLE IF NOT EXISTS provider_health (
+            provider_key TEXT PRIMARY KEY,
+            consecutive_failures INTEGER NOT NULL,
+            first_failed_at INTEGER NOT NULL,
+            last_failed_at INTEGER NOT NULL,
+            last_error TEXT NOT NULL,
+            alert_event_id TEXT
+        );
         ",
-    )
+    )?;
+    ensure_column(
+        connection,
+        "reset_events",
+        "current_remaining",
+        "REAL NOT NULL DEFAULT 100",
+    )?;
+    ensure_column(
+        connection,
+        "reset_events",
+        "event_kind",
+        "TEXT NOT NULL DEFAULT 'quota_reset'",
+    )?;
+    ensure_column(
+        connection,
+        "reset_events",
+        "reason",
+        "TEXT NOT NULL DEFAULT 'legacy'",
+    )?;
+    ensure_column(connection, "reset_events", "detail", "TEXT")?;
+    Ok(())
+}
+
+fn ensure_column(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> rusqlite::Result<()> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if !columns.iter().any(|existing| existing == column) {
+        connection.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+            [],
+        )?;
+    }
+    Ok(())
 }
 
 async fn poll_loop(state: Arc<AppState>) {
@@ -262,6 +360,7 @@ async fn poll_loop(state: Arc<AppState>) {
 }
 
 async fn poll_once(state: &Arc<AppState>) -> Result<(), String> {
+    let _poll_guard = state.poll_lock.lock().await;
     let now = Utc::now().timestamp();
     let (openai_allowed, claude_allowed) = {
         let runtime = state.runtime.read().await;
@@ -312,11 +411,13 @@ async fn handle_provider_result(
                 persist_snapshot(state, provider_key, &snapshot)?;
             }
             prune_inactive_snapshots(state, provider_key, &active_windows)?;
+            record_provider_recovery(state, provider_key)?;
             let mut runtime = state.runtime.write().await;
             runtime.provider_errors.remove(provider_key);
             runtime.next_allowed_at.remove(provider_key);
         }
         Err(error) => {
+            record_provider_failure(state, provider_key, &error)?;
             let mut runtime = state.runtime.write().await;
             if let ProviderError::RateLimited { retry_after_secs } = &error {
                 let delay = retry_after_secs
@@ -388,7 +489,22 @@ fn persist_snapshot(
         )
         .optional()
         .map_err(|error| error.to_string())?;
+    let candidate = load_reset_candidate(&transaction, provider_key, &snapshot.window_type)?;
 
+    transaction
+        .execute(
+            "INSERT INTO snapshot_observations(
+               provider_key, window_type, payload_json, reset_at, observed_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                provider_key,
+                snapshot.window_type,
+                payload,
+                snapshot.reset_at,
+                now
+            ],
+        )
+        .map_err(|error| error.to_string())?;
     transaction
         .execute(
             "INSERT INTO snapshots(provider_key, window_type, payload_json, reset_at, observed_at)
@@ -406,80 +522,400 @@ fn persist_snapshot(
             ],
         )
         .map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            "DELETE FROM snapshot_observations WHERE observed_at < ?1",
+            params![now - SNAPSHOT_HISTORY_RETENTION_SECS],
+        )
+        .map_err(|error| error.to_string())?;
 
     if let Some((old_reset_at, previous_remaining)) = previous {
-        if let Some(reason) = confirmed_reset_reason(
+        if let Some(reason) = immediate_reset_reason(
             old_reset_at,
             snapshot.reset_at,
             previous_remaining,
             snapshot.remaining_percent,
             now,
         ) {
-            let event_id = reset_event_id(provider_key, &snapshot.window_type, old_reset_at);
-            let inserted = transaction
+            let baseline = candidate
+                .as_ref()
+                .map(|value| value.baseline_remaining)
+                .unwrap_or(previous_remaining);
+            let event_old_reset = candidate
+                .as_ref()
+                .map(|value| value.old_reset_at)
+                .unwrap_or(old_reset_at);
+            enqueue_quota_reset(
+                &transaction,
+                provider_key,
+                snapshot,
+                event_old_reset,
+                baseline,
+                now,
+                reason,
+            )?;
+            delete_reset_candidate(&transaction, provider_key, &snapshot.window_type)?;
+        } else if let Some(candidate) = candidate {
+            if reset_candidate_confirmed(&candidate, snapshot.remaining_percent) {
+                enqueue_quota_reset(
+                    &transaction,
+                    provider_key,
+                    snapshot,
+                    candidate.old_reset_at,
+                    candidate.baseline_remaining,
+                    candidate.first_observed_at,
+                    "usage_recovery_confirmed",
+                )?;
+            }
+            delete_reset_candidate(&transaction, provider_key, &snapshot.window_type)?;
+        } else if is_significant_recovery(previous_remaining, snapshot.remaining_percent) {
+            transaction
                 .execute(
-                    "INSERT OR IGNORE INTO reset_events(
-                       event_id, provider, window_type, old_reset_at, new_reset_at,
-                       previous_remaining, created_at
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    "INSERT INTO reset_candidates(
+                       provider_key, window_type, provider, baseline_remaining,
+                       candidate_remaining, old_reset_at, new_reset_at,
+                       first_observed_at, last_observed_at, confirmations
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, 1)
+                     ON CONFLICT(provider_key, window_type) DO UPDATE SET
+                       provider = excluded.provider,
+                       baseline_remaining = excluded.baseline_remaining,
+                       candidate_remaining = excluded.candidate_remaining,
+                       old_reset_at = excluded.old_reset_at,
+                       new_reset_at = excluded.new_reset_at,
+                       first_observed_at = excluded.first_observed_at,
+                       last_observed_at = excluded.last_observed_at,
+                       confirmations = 1",
                     params![
-                        event_id,
-                        snapshot.provider,
+                        provider_key,
                         snapshot.window_type,
+                        snapshot.provider,
+                        previous_remaining,
+                        snapshot.remaining_percent,
                         old_reset_at,
                         snapshot.reset_at,
-                        previous_remaining,
                         now
                     ],
                 )
                 .map_err(|error| error.to_string())?;
-            if inserted > 0 {
-                transaction
-                    .execute(
-                        "INSERT INTO email_outbox(event_id, next_attempt_at) VALUES (?1, ?2)",
-                        params![event_id, now],
-                    )
-                    .map_err(|error| error.to_string())?;
-                info!(
-                    provider = provider_key,
-                    window = snapshot.window_type,
-                    old_reset_at,
-                    new_reset_at = snapshot.reset_at,
-                    reason,
-                    "confirmed quota reset"
-                );
-            }
+            info!(
+                provider = provider_key,
+                window = snapshot.window_type,
+                previous_remaining,
+                current_remaining = snapshot.remaining_percent,
+                "quota recovery candidate detected"
+            );
         }
     }
     transaction.commit().map_err(|error| error.to_string())
 }
 
-fn confirmed_reset_reason(
+fn immediate_reset_reason(
     old_reset_at: i64,
     new_reset_at: i64,
     previous_remaining: f64,
     current_remaining: f64,
     observed_at: i64,
 ) -> Option<&'static str> {
-    // Do not treat provider schedule corrections as resets before the old boundary.
-    // A small allowance covers clock skew between the provider and this host.
-    if old_reset_at <= 0 || observed_at < old_reset_at.saturating_sub(120) {
-        return None;
-    }
-    if new_reset_at > old_reset_at + 60 {
+    let old_boundary_reached = old_reset_at > 0 && observed_at >= old_reset_at.saturating_sub(120);
+    if old_boundary_reached && new_reset_at > old_reset_at + 60 {
         return Some("next_reset_advanced");
     }
-    // Claude omits `resets_at` after a completed window becomes idle. Confirm that
-    // transition only when the old boundary was reached and quota actually returned
-    // to effectively 100%, so a transient missing field cannot create an email.
-    if new_reset_at == 0 && previous_remaining < 99.5 && current_remaining >= 99.5 {
+    if old_boundary_reached
+        && new_reset_at == 0
+        && previous_remaining < 99.5
+        && current_remaining >= 99.5
+    {
         return Some("window_completed_idle");
     }
     None
 }
 
-fn reset_event_id(provider: &str, window_type: &str, old_reset_at: i64) -> String {
-    let digest = sha256(format!("{provider}|{window_type}|{old_reset_at}").as_bytes());
+fn is_significant_recovery(previous_remaining: f64, current_remaining: f64) -> bool {
+    current_remaining - previous_remaining >= RESET_RECOVERY_MIN_POINTS
+}
+
+fn reset_candidate_confirmed(candidate: &ResetCandidate, current_remaining: f64) -> bool {
+    candidate.candidate_remaining > candidate.baseline_remaining
+        && current_remaining - candidate.baseline_remaining >= RESET_CONFIRMATION_MIN_POINTS
+}
+
+fn reset_event_id(
+    provider: &str,
+    window_type: &str,
+    detected_at: i64,
+    old_reset_at: i64,
+) -> String {
+    let digest =
+        sha256(format!("v2|{provider}|{window_type}|{detected_at}|{old_reset_at}").as_bytes());
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn load_reset_candidate(
+    transaction: &Transaction<'_>,
+    provider_key: &str,
+    window_type: &str,
+) -> Result<Option<ResetCandidate>, String> {
+    transaction
+        .query_row(
+            "SELECT baseline_remaining, candidate_remaining, old_reset_at,
+                    first_observed_at
+             FROM reset_candidates
+             WHERE provider_key = ?1 AND window_type = ?2",
+            params![provider_key, window_type],
+            |row| {
+                Ok(ResetCandidate {
+                    baseline_remaining: row.get(0)?,
+                    candidate_remaining: row.get(1)?,
+                    old_reset_at: row.get(2)?,
+                    first_observed_at: row.get(3)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|error| error.to_string())
+}
+
+fn delete_reset_candidate(
+    transaction: &Transaction<'_>,
+    provider_key: &str,
+    window_type: &str,
+) -> Result<(), String> {
+    transaction
+        .execute(
+            "DELETE FROM reset_candidates WHERE provider_key = ?1 AND window_type = ?2",
+            params![provider_key, window_type],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn enqueue_quota_reset(
+    transaction: &Transaction<'_>,
+    provider_key: &str,
+    snapshot: &UsageSnapshot,
+    old_reset_at: i64,
+    previous_remaining: f64,
+    detected_at: i64,
+    reason: &str,
+) -> Result<(), String> {
+    let event_id = reset_event_id(
+        provider_key,
+        &snapshot.window_type,
+        detected_at,
+        old_reset_at,
+    );
+    let inserted = insert_event(
+        transaction,
+        &event_id,
+        &snapshot.provider,
+        &snapshot.window_type,
+        old_reset_at,
+        snapshot.reset_at,
+        previous_remaining,
+        snapshot.remaining_percent,
+        "quota_reset",
+        reason,
+        None,
+        Utc::now().timestamp(),
+    )?;
+    if inserted {
+        info!(
+            provider = provider_key,
+            window = snapshot.window_type,
+            old_reset_at,
+            new_reset_at = snapshot.reset_at,
+            previous_remaining,
+            current_remaining = snapshot.remaining_percent,
+            reason,
+            "confirmed quota reset"
+        );
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_event(
+    transaction: &Transaction<'_>,
+    event_id: &str,
+    provider: &str,
+    window_type: &str,
+    old_reset_at: i64,
+    new_reset_at: i64,
+    previous_remaining: f64,
+    current_remaining: f64,
+    event_kind: &str,
+    reason: &str,
+    detail: Option<&str>,
+    created_at: i64,
+) -> Result<bool, String> {
+    let inserted = transaction
+        .execute(
+            "INSERT OR IGNORE INTO reset_events(
+               event_id, provider, window_type, old_reset_at, new_reset_at,
+               previous_remaining, current_remaining, event_kind, reason, detail, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                event_id,
+                provider,
+                window_type,
+                old_reset_at,
+                new_reset_at,
+                previous_remaining,
+                current_remaining,
+                event_kind,
+                reason,
+                detail,
+                created_at
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    if inserted > 0 {
+        transaction
+            .execute(
+                "INSERT INTO email_outbox(event_id, next_attempt_at) VALUES (?1, ?2)",
+                params![event_id, created_at],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(inserted > 0)
+}
+
+fn provider_failure_alert_threshold(error: &ProviderError) -> i64 {
+    match error {
+        ProviderError::Unauthorized(_) | ProviderError::MissingCredentials(_) => 3,
+        ProviderError::RateLimited { .. } => 12,
+        ProviderError::Transport(_) | ProviderError::InvalidResponse(_) => 6,
+    }
+}
+
+fn record_provider_failure(
+    state: &Arc<AppState>,
+    provider_key: &str,
+    error: &ProviderError,
+) -> Result<(), String> {
+    let now = Utc::now().timestamp();
+    let mut database = state
+        .database
+        .lock()
+        .map_err(|_| "database mutex poisoned")?;
+    let transaction = database.transaction().map_err(|error| error.to_string())?;
+    let previous: Option<(i64, i64, Option<String>)> = transaction
+        .query_row(
+            "SELECT consecutive_failures, first_failed_at, alert_event_id
+             FROM provider_health WHERE provider_key = ?1",
+            params![provider_key],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let (consecutive_failures, first_failed_at, existing_alert) = match previous {
+        Some((count, first_failed_at, alert)) => (count + 1, first_failed_at, alert),
+        None => (1, now, None),
+    };
+    transaction
+        .execute(
+            "INSERT INTO provider_health(
+               provider_key, consecutive_failures, first_failed_at,
+               last_failed_at, last_error, alert_event_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(provider_key) DO UPDATE SET
+               consecutive_failures = excluded.consecutive_failures,
+               first_failed_at = excluded.first_failed_at,
+               last_failed_at = excluded.last_failed_at,
+               last_error = excluded.last_error,
+               alert_event_id = excluded.alert_event_id",
+            params![
+                provider_key,
+                consecutive_failures,
+                first_failed_at,
+                now,
+                error.to_string(),
+                existing_alert
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    if existing_alert.is_none() && consecutive_failures >= provider_failure_alert_threshold(error) {
+        let event_id = monitor_event_id(provider_key, "provider_error", first_failed_at);
+        let inserted = insert_event(
+            &transaction,
+            &event_id,
+            provider_key,
+            "monitor",
+            0,
+            0,
+            0.0,
+            0.0,
+            "provider_error",
+            "consecutive_poll_failures",
+            Some(&error.to_string()),
+            now,
+        )?;
+        if inserted {
+            transaction
+                .execute(
+                    "UPDATE provider_health SET alert_event_id = ?1 WHERE provider_key = ?2",
+                    params![event_id, provider_key],
+                )
+                .map_err(|error| error.to_string())?;
+            warn!(
+                provider = provider_key,
+                consecutive_failures, "provider monitoring failure alert queued"
+            );
+        }
+    }
+    transaction.commit().map_err(|error| error.to_string())
+}
+
+fn record_provider_recovery(state: &Arc<AppState>, provider_key: &str) -> Result<(), String> {
+    let now = Utc::now().timestamp();
+    let mut database = state
+        .database
+        .lock()
+        .map_err(|_| "database mutex poisoned")?;
+    let transaction = database.transaction().map_err(|error| error.to_string())?;
+    let health: Option<(i64, i64, String, Option<String>)> = transaction
+        .query_row(
+            "SELECT consecutive_failures, first_failed_at, last_error, alert_event_id
+             FROM provider_health WHERE provider_key = ?1",
+            params![provider_key],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    if let Some((consecutive_failures, first_failed_at, last_error, Some(alert_event_id))) = health
+    {
+        let event_id = monitor_event_id(provider_key, "provider_recovered", now);
+        let detail = format!(
+            "Recovered after {consecutive_failures} failures since {}. Last error: {last_error}. Alert event: {alert_event_id}",
+            format_timestamp(first_failed_at)
+        );
+        insert_event(
+            &transaction,
+            &event_id,
+            provider_key,
+            "monitor",
+            0,
+            0,
+            0.0,
+            0.0,
+            "provider_recovered",
+            "poll_succeeded",
+            Some(&detail),
+            now,
+        )?;
+        info!(provider = provider_key, "provider monitoring recovered");
+    }
+    transaction
+        .execute(
+            "DELETE FROM provider_health WHERE provider_key = ?1",
+            params![provider_key],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction.commit().map_err(|error| error.to_string())
+}
+
+fn monitor_event_id(provider: &str, kind: &str, timestamp: i64) -> String {
+    let digest = sha256(format!("monitor|{provider}|{kind}|{timestamp}").as_bytes());
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
@@ -498,7 +934,7 @@ async fn process_outbox(state: &Arc<AppState>) -> Result<(), String> {
     }
     let items = load_pending_outbox(state)?;
     for item in items {
-        match send_reset_email(state, &item).await {
+        match send_event_email(state, &item).await {
             Ok(message_id) => mark_outbox_sent(state, item.id, &message_id)?,
             Err(error) => mark_outbox_failed(state, item.id, item.attempts + 1, &error)?,
         }
@@ -514,7 +950,8 @@ fn load_pending_outbox(state: &Arc<AppState>) -> Result<Vec<OutboxItem>, String>
     let mut statement = database
         .prepare(
             "SELECT o.id, e.event_id, e.provider, e.window_type, e.old_reset_at,
-                    e.new_reset_at, e.previous_remaining, o.attempts
+                    e.new_reset_at, e.previous_remaining, e.current_remaining,
+                    e.event_kind, e.reason, e.detail, o.attempts
              FROM email_outbox o
              JOIN reset_events e ON e.event_id = o.event_id
              WHERE o.sent_at IS NULL AND o.next_attempt_at <= ?1
@@ -531,7 +968,11 @@ fn load_pending_outbox(state: &Arc<AppState>) -> Result<Vec<OutboxItem>, String>
                 old_reset_at: row.get(4)?,
                 new_reset_at: row.get(5)?,
                 previous_remaining: row.get(6)?,
-                attempts: row.get(7)?,
+                current_remaining: row.get(7)?,
+                event_kind: row.get(8)?,
+                reason: row.get(9)?,
+                detail: row.get(10)?,
+                attempts: row.get(11)?,
             })
         })
         .map_err(|error| error.to_string())?;
@@ -539,30 +980,130 @@ fn load_pending_outbox(state: &Arc<AppState>) -> Result<Vec<OutboxItem>, String>
         .map_err(|error| error.to_string())
 }
 
-async fn send_reset_email(state: &Arc<AppState>, item: &OutboxItem) -> Result<String, String> {
+async fn send_event_email(state: &Arc<AppState>, item: &OutboxItem) -> Result<String, String> {
     let token = state
         .postmark_token
         .as_deref()
         .ok_or_else(|| "Postmark token is not configured".to_string())?;
+    match item.event_kind.as_str() {
+        "provider_error" => send_provider_error_email(state, token, item).await,
+        "provider_recovered" => send_provider_recovery_email(state, token, item).await,
+        _ => send_reset_email(state, token, item).await,
+    }
+}
+
+async fn send_reset_email(
+    state: &Arc<AppState>,
+    token: &str,
+    item: &OutboxItem,
+) -> Result<String, String> {
     let old_local = format_timestamp(item.old_reset_at);
     let new_local = format_next_reset(item.new_reset_at);
-    let provider_name = if item.provider.starts_with("openai") {
-        "Codex"
-    } else if item.provider.starts_with("claude") {
-        "Claude"
-    } else {
-        &item.provider
-    };
+    let provider_name = provider_display_name(&item.provider);
     let subject = format!("[Panel4AI] {provider_name} {} 额度已重置", item.window_type);
     let text = format!(
-        "{provider_name} 的 {} 额度窗口已确认重置。\n\n上一个重置点：{old_local}\n下一个重置点：{new_local}\n重置前剩余：{:.1}%\n事件 ID：{}\n",
-        item.window_type, item.previous_remaining, item.event_id
+        "{provider_name} 的 {} 额度窗口已确认重置。\n\n上一个重置点：{old_local}\n下一个重置点：{new_local}\n重置前剩余：{:.1}%\n当前剩余：{:.1}%\n检测方式：{}\n事件 ID：{}\n",
+        item.window_type,
+        item.previous_remaining,
+        item.current_remaining,
+        item.reason,
+        item.event_id
     );
     let html = format!(
-        "<h2>{provider_name} 额度已重置</h2><p>窗口：<strong>{}</strong></p><ul><li>上一个重置点：{old_local}</li><li>下一个重置点：{new_local}</li><li>重置前剩余：{:.1}%</li></ul><p style=\"color:#777;font-size:12px\">事件 ID：{}</p>",
-        item.window_type, item.previous_remaining, item.event_id
+        "<h2>{provider_name} 额度已重置</h2><p>窗口：<strong>{}</strong></p><ul><li>上一个重置点：{old_local}</li><li>下一个重置点：{new_local}</li><li>重置前剩余：{:.1}%</li><li>当前剩余：{:.1}%</li><li>检测方式：{}</li></ul><p style=\"color:#777;font-size:12px\">事件 ID：{}</p>",
+        item.window_type,
+        item.previous_remaining,
+        item.current_remaining,
+        item.reason,
+        item.event_id
     );
-    send_postmark(state, token, &subject, &text, &html, &item.event_id).await
+    send_postmark(
+        state,
+        token,
+        &subject,
+        &text,
+        &html,
+        &item.event_id,
+        "quota-reset",
+    )
+    .await
+}
+
+async fn send_provider_error_email(
+    state: &Arc<AppState>,
+    token: &str,
+    item: &OutboxItem,
+) -> Result<String, String> {
+    let provider_name = provider_display_name(&item.provider);
+    let subject = format!("[Panel4AI] {provider_name} 额度监控异常");
+    let detail = item.detail.as_deref().unwrap_or("未知错误");
+    let text = format!(
+        "{provider_name} 额度监控连续失败，当前无法可靠检测重置。\n\n错误：{detail}\n事件 ID：{}\n",
+        item.event_id
+    );
+    let html = format!(
+        "<h2>{provider_name} 额度监控异常</h2><p>连续查询失败，当前无法可靠检测重置。</p><p><strong>错误：</strong>{}</p><p style=\"color:#777;font-size:12px\">事件 ID：{}</p>",
+        html_escape(detail),
+        item.event_id
+    );
+    send_postmark(
+        state,
+        token,
+        &subject,
+        &text,
+        &html,
+        &item.event_id,
+        "monitor-health",
+    )
+    .await
+}
+
+async fn send_provider_recovery_email(
+    state: &Arc<AppState>,
+    token: &str,
+    item: &OutboxItem,
+) -> Result<String, String> {
+    let provider_name = provider_display_name(&item.provider);
+    let subject = format!("[Panel4AI] {provider_name} 额度监控已恢复");
+    let detail = item.detail.as_deref().unwrap_or("查询已恢复正常");
+    let text = format!(
+        "{provider_name} 额度监控已恢复。\n\n{detail}\n事件 ID：{}\n",
+        item.event_id
+    );
+    let html = format!(
+        "<h2>{provider_name} 额度监控已恢复</h2><p>{}</p><p style=\"color:#777;font-size:12px\">事件 ID：{}</p>",
+        html_escape(detail),
+        item.event_id
+    );
+    send_postmark(
+        state,
+        token,
+        &subject,
+        &text,
+        &html,
+        &item.event_id,
+        "monitor-health",
+    )
+    .await
+}
+
+fn provider_display_name(provider: &str) -> &str {
+    if provider.starts_with("openai") {
+        "Codex"
+    } else if provider.starts_with("claude") {
+        "Claude"
+    } else {
+        provider
+    }
+}
+
+fn html_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 async fn send_postmark(
@@ -572,6 +1113,7 @@ async fn send_postmark(
     text: &str,
     html: &str,
     event_id: &str,
+    tag: &str,
 ) -> Result<String, String> {
     let response = state
         .postmark_client
@@ -585,7 +1127,7 @@ async fn send_postmark(
             "TextBody": text,
             "HtmlBody": html,
             "MessageStream": state.config.postmark_message_stream,
-            "Tag": "quota-reset",
+            "Tag": tag,
             "Metadata": { "event_id": event_id }
         }))
         .send()
@@ -770,6 +1312,7 @@ async fn test_email(
         "Panel4AI VPS 邮件通道工作正常。",
         "<h2>Panel4AI 测试成功</h2><p>VPS 邮件通道工作正常。</p>",
         &event_id,
+        "test",
     )
     .await
     .map_err(|message| {
@@ -857,9 +1400,9 @@ mod tests {
 
     #[test]
     fn reset_event_ids_are_stable_and_window_specific() {
-        let first = reset_event_id("openai", "hourly5", 1_700_000_000);
-        let second = reset_event_id("openai", "hourly5", 1_700_000_000);
-        let different = reset_event_id("openai", "weekly", 1_700_000_000);
+        let first = reset_event_id("openai", "hourly5", 1_700_000_000, 1_700_100_000);
+        let second = reset_event_id("openai", "hourly5", 1_700_000_000, 1_700_100_000);
+        let different = reset_event_id("openai", "weekly", 1_700_000_000, 1_700_100_000);
         assert_eq!(first, second);
         assert_ne!(first, different);
     }
@@ -867,7 +1410,7 @@ mod tests {
     #[test]
     fn confirms_reset_when_next_boundary_advances_after_old_boundary() {
         assert_eq!(
-            confirmed_reset_reason(1_000, 2_000, 20.0, 99.0, 1_001),
+            immediate_reset_reason(1_000, 2_000, 20.0, 99.0, 1_001),
             Some("next_reset_advanced")
         );
     }
@@ -875,20 +1418,129 @@ mod tests {
     #[test]
     fn confirms_claude_reset_when_completed_window_becomes_idle() {
         assert_eq!(
-            confirmed_reset_reason(1_000, 0, 12.5, 100.0, 1_001),
+            immediate_reset_reason(1_000, 0, 12.5, 100.0, 1_001),
             Some("window_completed_idle")
         );
     }
 
     #[test]
-    fn does_not_confirm_idle_transition_before_boundary() {
-        assert_eq!(confirmed_reset_reason(2_000, 0, 12.5, 100.0, 1_000), None);
+    fn early_reset_uses_usage_confirmation_instead_of_time_gate() {
+        assert_eq!(
+            immediate_reset_reason(2_000, 3_000, 12.5, 100.0, 1_000),
+            None
+        );
+        assert!(is_significant_recovery(12.5, 100.0));
+        let candidate = ResetCandidate {
+            baseline_remaining: 12.5,
+            candidate_remaining: 100.0,
+            old_reset_at: 2_000,
+            first_observed_at: 1_000,
+        };
+        assert!(reset_candidate_confirmed(&candidate, 98.0));
     }
 
     #[test]
-    fn does_not_confirm_missing_reset_without_quota_recovery() {
-        assert_eq!(confirmed_reset_reason(1_000, 0, 12.5, 12.5, 1_001), None);
-        assert_eq!(confirmed_reset_reason(1_000, 0, 100.0, 100.0, 1_001), None);
+    fn ignores_small_or_reverted_usage_changes() {
+        assert!(!is_significant_recovery(80.0, 82.0));
+        let candidate = ResetCandidate {
+            baseline_remaining: 40.0,
+            candidate_remaining: 70.0,
+            old_reset_at: 2_000,
+            first_observed_at: 1_000,
+        };
+        assert!(!reset_candidate_confirmed(&candidate, 40.5));
+    }
+
+    #[test]
+    fn database_initialization_is_idempotent_and_adds_event_metadata() {
+        let database = Connection::open_in_memory().expect("in-memory database");
+        initialize_database(&database).expect("first initialization");
+        initialize_database(&database).expect("second initialization");
+        let mut statement = database
+            .prepare("PRAGMA table_info(reset_events)")
+            .expect("table info");
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("column query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("columns");
+        for expected in ["current_remaining", "event_kind", "reason", "detail"] {
+            assert!(columns.iter().any(|column| column == expected));
+        }
+        let history_table: String = database
+            .query_row(
+                "SELECT name FROM sqlite_master
+                 WHERE type = 'table' AND name = 'snapshot_observations'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("history table");
+        assert_eq!(history_table, "snapshot_observations");
+    }
+
+    #[test]
+    fn repeated_auth_failures_queue_one_alert_and_recovery() {
+        let database = Connection::open_in_memory().expect("in-memory database");
+        initialize_database(&database).expect("database initialization");
+        let quota = QuotaClient::new(
+            ProviderPaths {
+                codex_auth_path: "/tmp/panel4ai-test/codex/auth.json".into(),
+                codex_binary_path: None,
+                claude_auth_path: "/tmp/panel4ai-test/claude/auth.json".into(),
+            },
+            20.0,
+        )
+        .expect("quota client");
+        let state = Arc::new(AppState {
+            config: Config::default(),
+            quota,
+            database: Mutex::new(database),
+            postmark_client: reqwest::Client::new(),
+            postmark_token: None,
+            api_token_hash: sha256(b"test"),
+            runtime: RwLock::new(RuntimeStatus::default()),
+            poll_lock: AsyncMutex::new(()),
+        });
+        let failure = ProviderError::Unauthorized("expired login".to_string());
+        for _ in 0..3 {
+            record_provider_failure(&state, "openai", &failure).expect("record failure");
+        }
+        {
+            let database = state.database.lock().expect("database");
+            let alerts: i64 = database
+                .query_row(
+                    "SELECT COUNT(*) FROM reset_events WHERE event_kind = 'provider_error'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("alert count");
+            let pending: i64 = database
+                .query_row("SELECT COUNT(*) FROM email_outbox", [], |row| row.get(0))
+                .expect("outbox count");
+            assert_eq!(alerts, 1);
+            assert_eq!(pending, 1);
+        }
+        record_provider_failure(&state, "openai", &failure).expect("record extra failure");
+        record_provider_recovery(&state, "openai").expect("record recovery");
+        let database = state.database.lock().expect("database");
+        let events = database
+            .prepare("SELECT event_kind FROM reset_events ORDER BY created_at, event_kind")
+            .expect("events statement")
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("events query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("events");
+        assert_eq!(
+            events,
+            vec![
+                "provider_error".to_string(),
+                "provider_recovered".to_string()
+            ]
+        );
+        let health_rows: i64 = database
+            .query_row("SELECT COUNT(*) FROM provider_health", [], |row| row.get(0))
+            .expect("health count");
+        assert_eq!(health_rows, 0);
     }
 
     #[test]

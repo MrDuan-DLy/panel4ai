@@ -2,16 +2,27 @@
 
 Panel4AI is a two-binary quota monitor for Codex and Claude subscriptions:
 
-- `panel4ai-server` runs continuously on a VPS, polls every quota window, confirms reset transitions, persists state in SQLite, and sends reset email through Postmark.
+- `panel4ai-server` runs continuously on a VPS, polls every quota window, confirms reset transitions, persists state in SQLite, and sends reset and monitoring-health email through Postmark.
 - The Tauri desktop app reads the VPS snapshots over Tailscale and can fall back to local OAuth data when the VPS is unavailable.
 
-The quota endpoints used by the consumer subscriptions are not documented public APIs. Provider adapters are isolated in `panel4ai-core`, rate limiting is respected, and a reset notification is emitted only when the provider's `reset_at` value advances. A missing reset time is never guessed.
+Codex quota polling uses the official `codex app-server` stable
+`account/rateLimits/read` protocol by default, so the Codex CLI owns ChatGPT
+authentication and token refresh. The legacy direct adapter remains available
+only as an explicit compatibility mode. Claude's consumer usage endpoint is not
+a documented public API, so that adapter remains isolated in `panel4ai-core`.
+
+Reset detection treats a confirmed usage decrease as the primary signal and a
+provider reset timestamp as corroborating evidence. Early/manual resets are
+confirmed across two successful polls; scheduled boundary transitions can be
+confirmed immediately. Short-term observations and pending candidates are
+durable in SQLite.
 
 ## Features
 
 - Continuous Codex and Claude subscription quota monitoring
 - All returned session, weekly, model, and code-review windows are stored on the VPS
 - Confirmed-reset email notifications with a durable SQLite outbox and retry schedule
+- Provider failure and recovery email after repeated polling errors
 - Bearer-authenticated VPS API, intended to bind only to a Tailscale address
 - System tray integration with status indicators (ok/warning/danger)
 - OAuth login support for both OpenAI and Claude
@@ -108,6 +119,20 @@ curl http://100.x.y.z:8787/health
 sudo systemctl status panel4ai-server
 sudo journalctl -u panel4ai-server -n 100 --no-pager
 ```
+
+The health endpoint reports each provider independently. `openai: "error"`
+means Codex data is stale even if `codex login status` still finds a cached
+credential. Re-authenticate on the VPS with:
+
+```bash
+sudo -u panel4ai env HOME=/var/lib/panel4ai \
+  CODEX_HOME=/var/lib/panel4ai/codex-home \
+  /var/lib/panel4ai/.local/bin/codex login --device-auth
+```
+
+Set `codex_use_app_server = false` only when running an older Codex CLI that
+does not expose `account/rateLimits/read`; compatibility mode directly reads
+the configured `codex_auth_path`.
 
 Postmark test mode can send only to verified recipient domains. Set the sender, recipient, and message stream with the `PANEL4AI_POSTMARK_*` installer variables shown above; the checked-in values are non-working examples by design.
 
