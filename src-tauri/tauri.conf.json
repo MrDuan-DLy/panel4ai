@@ -1,12 +1,12 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "panel4ai",
-  "version": "0.1.10",
+  "version": "0.1.11",
   "identifier": "ai.panel4.desktop",
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://localhost:1420",
-    "beforeDevCommand": "npm run dev -- --host 0.0.0.0 --port 1420",
+    "beforeDevCommand": "npm run dev -- --host 127.0.0.1 --port 1420",
     "beforeBuildCommand": "npm run build"
   },
   "app": {

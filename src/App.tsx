@@ -210,12 +210,15 @@ function App() {
   }, [])
 
   useEffect(() => {
-    void refresh()
+    const initialRefresh = window.setTimeout(() => {
+      void refresh()
+    }, 0)
     const timer = window.setInterval(() => {
       void refresh()
     }, Math.max(15, settings.refreshIntervalSec) * 1000)
 
     return () => {
+      window.clearTimeout(initialRefresh)
       window.clearInterval(timer)
     }
   }, [refresh, settings.refreshIntervalSec])
@@ -425,7 +428,7 @@ function App() {
 
             <div className="status-row">
               {loading ? 'Refreshing...' : `Updated: ${lastUpdated}`}
-              <span className="version-tag">v0.1.10</span>
+              <span className="version-tag">v0.1.11</span>
             </div>
 
             {!oauthStatus.available && (

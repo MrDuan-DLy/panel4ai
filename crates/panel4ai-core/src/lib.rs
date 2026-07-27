@@ -5,7 +5,11 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStdout, Command};
+use tokio::time::timeout;
 
 const OPENAI_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const OPENAI_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
@@ -62,6 +66,7 @@ pub struct SnapshotEnvelope {
 #[derive(Debug, Clone)]
 pub struct ProviderPaths {
     pub codex_auth_path: PathBuf,
+    pub codex_binary_path: Option<PathBuf>,
     pub claude_auth_path: PathBuf,
 }
 
@@ -197,6 +202,34 @@ struct WhamWindow {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AppServerRateLimitsResult {
+    rate_limits: AppServerRateLimits,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AppServerRateLimits {
+    #[serde(default)]
+    plan_type: Option<String>,
+    #[serde(default)]
+    primary: Option<AppServerRateLimitWindow>,
+    #[serde(default)]
+    secondary: Option<AppServerRateLimitWindow>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AppServerRateLimitWindow {
+    #[serde(default)]
+    used_percent: Option<f64>,
+    #[serde(default)]
+    window_duration_mins: Option<i64>,
+    #[serde(default)]
+    resets_at: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
 struct ClaudeUsageResponse {
     #[serde(flatten)]
     windows: HashMap<String, Value>,
@@ -233,6 +266,13 @@ impl QuotaClient {
     }
 
     pub async fn fetch_openai(&self) -> Result<Vec<UsageSnapshot>, ProviderError> {
+        if let Some(binary_path) = self.paths.codex_binary_path.as_deref() {
+            return self.fetch_openai_app_server(binary_path).await;
+        }
+        self.fetch_openai_legacy().await
+    }
+
+    async fn fetch_openai_legacy(&self) -> Result<Vec<UsageSnapshot>, ProviderError> {
         let mut document = read_json_document(&self.paths.codex_auth_path)?;
         let mut auth: CodexAuthFile =
             serde_json::from_value(document.clone()).map_err(|error| {
@@ -277,6 +317,89 @@ impl QuotaClient {
         };
 
         Ok(self.openai_snapshots(usage))
+    }
+
+    async fn fetch_openai_app_server(
+        &self,
+        binary_path: &Path,
+    ) -> Result<Vec<UsageSnapshot>, ProviderError> {
+        let codex_home = self
+            .paths
+            .codex_auth_path
+            .parent()
+            .ok_or_else(|| {
+                ProviderError::InvalidResponse(format!(
+                    "{} has no parent directory",
+                    self.paths.codex_auth_path.display()
+                ))
+            })?
+            .to_path_buf();
+        let home = codex_home
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| codex_home.clone());
+        let mut command = Command::new(binary_path);
+        command
+            .arg("app-server")
+            .arg("--stdio")
+            .env("CODEX_HOME", &codex_home)
+            .env("HOME", home)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let mut child = command.spawn().map_err(|error| {
+            ProviderError::Transport(format!(
+                "cannot start Codex app-server at {}: {error}",
+                binary_path.display()
+            ))
+        })?;
+        let mut stdin = child.stdin.take().ok_or_else(|| {
+            ProviderError::Transport("Codex app-server stdin is unavailable".to_string())
+        })?;
+        let stdout = child.stdout.take().ok_or_else(|| {
+            ProviderError::Transport("Codex app-server stdout is unavailable".to_string())
+        })?;
+        let mut stdout = BufReader::new(stdout);
+
+        let result = async {
+            write_app_server_message(
+                &mut stdin,
+                serde_json::json!({
+                    "method": "initialize",
+                    "id": 1,
+                    "params": {
+                        "clientInfo": {
+                            "name": "panel4ai",
+                            "title": "Panel4AI quota monitor",
+                            "version": env!("CARGO_PKG_VERSION")
+                        }
+                    }
+                }),
+            )
+            .await?;
+            read_app_server_response(&mut stdout, 1).await?;
+            write_app_server_message(
+                &mut stdin,
+                serde_json::json!({ "method": "initialized", "params": {} }),
+            )
+            .await?;
+            write_app_server_message(
+                &mut stdin,
+                serde_json::json!({
+                    "method": "account/rateLimits/read",
+                    "id": 2,
+                    "params": {}
+                }),
+            )
+            .await?;
+            let response = read_app_server_response(&mut stdout, 2).await?;
+            parse_app_server_rate_limits(response)
+        }
+        .await;
+        drop(stdin);
+        stop_child(&mut child).await;
+        result.map(|limits| self.app_server_openai_snapshots(limits))
     }
 
     pub async fn fetch_claude(&self) -> Result<Vec<UsageSnapshot>, ProviderError> {
@@ -436,6 +559,41 @@ impl QuotaClient {
             .collect()
     }
 
+    fn app_server_openai_snapshots(&self, limits: AppServerRateLimitsResult) -> Vec<UsageSnapshot> {
+        let provider = limits
+            .rate_limits
+            .plan_type
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| format!("openai-app-server ({})", value.trim()))
+            .unwrap_or_else(|| "openai-app-server".to_string());
+        let mut windows = Vec::new();
+        if let Some(window) = limits.rate_limits.primary {
+            let seconds = window.window_duration_mins.unwrap_or(300) * 60;
+            let kind = classify_openai_window(Some(seconds), "hourly5");
+            windows.push((kind, window, seconds));
+        }
+        if let Some(window) = limits.rate_limits.secondary {
+            let seconds = window.window_duration_mins.unwrap_or(10_080) * 60;
+            let kind = classify_openai_window(Some(seconds), "weekly");
+            windows.push((kind, window, seconds));
+        }
+        windows
+            .into_iter()
+            .map(|(kind, window, seconds)| {
+                snapshot(
+                    &provider,
+                    &kind,
+                    window.used_percent.unwrap_or(0.0).clamp(0.0, 100.0),
+                    window.resets_at.unwrap_or(0),
+                    seconds,
+                    self.alert_threshold_percent,
+                    None,
+                )
+            })
+            .collect()
+    }
+
     fn claude_snapshots(
         &self,
         tokens: &ClaudeTokens,
@@ -490,6 +648,86 @@ impl QuotaClient {
         snapshots.sort_by(|left, right| left.window_type.cmp(&right.window_type));
         snapshots
     }
+}
+
+async fn write_app_server_message(
+    stdin: &mut tokio::process::ChildStdin,
+    message: Value,
+) -> Result<(), ProviderError> {
+    let mut encoded = serde_json::to_vec(&message)
+        .map_err(|error| ProviderError::InvalidResponse(error.to_string()))?;
+    encoded.push(b'\n');
+    stdin.write_all(&encoded).await.map_err(|error| {
+        ProviderError::Transport(format!("cannot write to Codex app-server: {error}"))
+    })?;
+    stdin.flush().await.map_err(|error| {
+        ProviderError::Transport(format!("cannot flush Codex app-server request: {error}"))
+    })
+}
+
+async fn read_app_server_response(
+    stdout: &mut BufReader<ChildStdout>,
+    expected_id: i64,
+) -> Result<Value, ProviderError> {
+    timeout(Duration::from_secs(20), async {
+        loop {
+            let mut line = String::new();
+            let bytes = stdout.read_line(&mut line).await.map_err(|error| {
+                ProviderError::Transport(format!("cannot read Codex app-server response: {error}"))
+            })?;
+            if bytes == 0 {
+                return Err(ProviderError::Transport(
+                    "Codex app-server exited before replying".to_string(),
+                ));
+            }
+            let message: Value = serde_json::from_str(&line).map_err(|error| {
+                ProviderError::InvalidResponse(format!(
+                    "invalid Codex app-server JSONL response: {error}"
+                ))
+            })?;
+            if message.get("id").and_then(Value::as_i64) != Some(expected_id) {
+                continue;
+            }
+            if let Some(error) = message.get("error") {
+                return Err(ProviderError::Unauthorized(format!(
+                    "Codex app-server request failed: {}",
+                    compact_json(error)
+                )));
+            }
+            return message.get("result").cloned().ok_or_else(|| {
+                ProviderError::InvalidResponse(
+                    "Codex app-server response has no result".to_string(),
+                )
+            });
+        }
+    })
+    .await
+    .map_err(|_| ProviderError::Transport("Codex app-server timed out".to_string()))?
+}
+
+fn parse_app_server_rate_limits(value: Value) -> Result<AppServerRateLimitsResult, ProviderError> {
+    serde_json::from_value(value).map_err(|error| {
+        ProviderError::InvalidResponse(format!(
+            "invalid Codex app-server rate-limit response: {error}"
+        ))
+    })
+}
+
+fn compact_json(value: &Value) -> String {
+    let encoded = value.to_string();
+    const LIMIT_CHARS: usize = 500;
+    if encoded.chars().count() <= LIMIT_CHARS {
+        encoded
+    } else {
+        format!("{}…", encoded.chars().take(LIMIT_CHARS).collect::<String>())
+    }
+}
+
+async fn stop_child(child: &mut Child) {
+    if child.try_wait().ok().flatten().is_none() {
+        let _ = child.kill().await;
+    }
+    let _ = child.wait().await;
 }
 
 pub fn classify_openai_window(limit_window_seconds: Option<i64>, fallback: &str) -> String {
@@ -712,6 +950,76 @@ mod tests {
         assert_eq!(classify_openai_window(Some(18_000), "weekly"), "hourly5");
         assert_eq!(classify_openai_window(Some(604_800), "hourly5"), "weekly");
         assert_eq!(classify_openai_window(None, "hourly5"), "hourly5");
+    }
+
+    #[test]
+    fn supports_future_official_five_hour_and_weekly_windows() {
+        let limits = parse_app_server_rate_limits(serde_json::json!({
+            "rateLimits": {
+                "primary": {
+                    "usedPercent": 25,
+                    "windowDurationMins": 300,
+                    "resetsAt": 1_800_000_000
+                },
+                "secondary": {
+                    "usedPercent": 40,
+                    "windowDurationMins": 10_080,
+                    "resetsAt": 1_800_500_000
+                },
+                "rateLimitReachedType": null
+            },
+            "rateLimitResetCredits": null
+        }))
+        .expect("valid app-server payload");
+        let client = QuotaClient::new(
+            ProviderPaths {
+                codex_auth_path: "/tmp/codex/auth.json".into(),
+                codex_binary_path: None,
+                claude_auth_path: "/tmp/claude/auth.json".into(),
+            },
+            20.0,
+        )
+        .expect("quota client");
+        let snapshots = client.app_server_openai_snapshots(limits);
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots[0].window_type, "hourly5");
+        assert_eq!(snapshots[0].remaining_percent, 75.0);
+        assert_eq!(snapshots[1].window_type, "weekly");
+        assert_eq!(snapshots[1].remaining_percent, 60.0);
+    }
+
+    #[test]
+    fn supports_current_weekly_only_window_without_assuming_primary_is_five_hour() {
+        let limits = parse_app_server_rate_limits(serde_json::json!({
+            "rateLimits": {
+                "primary": {
+                    "usedPercent": 71,
+                    "windowDurationMins": 10_080,
+                    "resetsAt": 1_800_500_000
+                },
+                "secondary": null,
+                "planType": "prolite"
+            },
+            "rateLimitResetCredits": {
+                "availableCount": 0,
+                "credits": []
+            }
+        }))
+        .expect("valid weekly-only app-server payload");
+        let client = QuotaClient::new(
+            ProviderPaths {
+                codex_auth_path: "/tmp/codex/auth.json".into(),
+                codex_binary_path: None,
+                claude_auth_path: "/tmp/claude/auth.json".into(),
+            },
+            20.0,
+        )
+        .expect("quota client");
+        let snapshots = client.app_server_openai_snapshots(limits);
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].window_type, "weekly");
+        assert_eq!(snapshots[0].remaining_percent, 29.0);
+        assert_eq!(snapshots[0].provider, "openai-app-server (prolite)");
     }
 
     #[test]

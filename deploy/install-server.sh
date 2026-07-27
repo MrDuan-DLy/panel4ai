@@ -53,6 +53,8 @@ cat > /etc/panel4ai/server.toml <<EOF
 bind_addr = "${bind_addr}"
 database_path = "/var/lib/panel4ai/panel4ai.sqlite3"
 codex_auth_path = "/var/lib/panel4ai/codex-home/auth.json"
+codex_binary_path = "/var/lib/panel4ai/.local/bin/codex"
+codex_use_app_server = true
 claude_auth_path = "/var/lib/panel4ai/.claude/.credentials.json"
 api_token_file = "/etc/panel4ai/api-token"
 postmark_token_file = "/etc/panel4ai/postmark-token"
@@ -64,6 +66,8 @@ alert_threshold_percent = 20.0
 EOF
 chown root:panel4ai /etc/panel4ai/server.toml /etc/panel4ai/postmark-token
 chmod 0640 /etc/panel4ai/server.toml /etc/panel4ai/postmark-token
+find /var/lib/panel4ai -maxdepth 1 -type f -name 'panel4ai.sqlite3*' \
+  -exec chmod 0600 {} +
 
 systemctl daemon-reload
 systemctl enable --now panel4ai-server.service
