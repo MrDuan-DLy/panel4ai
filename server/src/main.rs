@@ -1009,13 +1009,14 @@ async fn send_reset_email(
         item.reason,
         item.event_id
     );
+    let provider_name_html = html_escape(provider_name);
+    let window_type_html = html_escape(&item.window_type);
+    let reason_html = html_escape(&item.reason);
+    let event_id_html = html_escape(&item.event_id);
     let html = format!(
-        "<h2>{provider_name} 额度已重置</h2><p>窗口：<strong>{}</strong></p><ul><li>上一个重置点：{old_local}</li><li>下一个重置点：{new_local}</li><li>重置前剩余：{:.1}%</li><li>当前剩余：{:.1}%</li><li>检测方式：{}</li></ul><p style=\"color:#777;font-size:12px\">事件 ID：{}</p>",
-        item.window_type,
+        "<h2>{provider_name_html} 额度已重置</h2><p>窗口：<strong>{window_type_html}</strong></p><ul><li>上一个重置点：{old_local}</li><li>下一个重置点：{new_local}</li><li>重置前剩余：{:.1}%</li><li>当前剩余：{:.1}%</li><li>检测方式：{reason_html}</li></ul><p style=\"color:#777;font-size:12px\">事件 ID：{event_id_html}</p>",
         item.previous_remaining,
         item.current_remaining,
-        item.reason,
-        item.event_id
     );
     send_postmark(
         state,
@@ -1037,14 +1038,15 @@ async fn send_provider_error_email(
     let provider_name = provider_display_name(&item.provider);
     let subject = format!("[Panel4AI] {provider_name} 额度监控异常");
     let detail = item.detail.as_deref().unwrap_or("未知错误");
+    let provider_name_html = html_escape(provider_name);
     let text = format!(
         "{provider_name} 额度监控连续失败，当前无法可靠检测重置。\n\n错误：{detail}\n事件 ID：{}\n",
         item.event_id
     );
     let html = format!(
-        "<h2>{provider_name} 额度监控异常</h2><p>连续查询失败，当前无法可靠检测重置。</p><p><strong>错误：</strong>{}</p><p style=\"color:#777;font-size:12px\">事件 ID：{}</p>",
+        "<h2>{provider_name_html} 额度监控异常</h2><p>连续查询失败，当前无法可靠检测重置。</p><p><strong>错误：</strong>{}</p><p style=\"color:#777;font-size:12px\">事件 ID：{}</p>",
         html_escape(detail),
-        item.event_id
+        html_escape(&item.event_id)
     );
     send_postmark(
         state,
@@ -1066,14 +1068,15 @@ async fn send_provider_recovery_email(
     let provider_name = provider_display_name(&item.provider);
     let subject = format!("[Panel4AI] {provider_name} 额度监控已恢复");
     let detail = item.detail.as_deref().unwrap_or("查询已恢复正常");
+    let provider_name_html = html_escape(provider_name);
     let text = format!(
         "{provider_name} 额度监控已恢复。\n\n{detail}\n事件 ID：{}\n",
         item.event_id
     );
     let html = format!(
-        "<h2>{provider_name} 额度监控已恢复</h2><p>{}</p><p style=\"color:#777;font-size:12px\">事件 ID：{}</p>",
+        "<h2>{provider_name_html} 额度监控已恢复</h2><p>{}</p><p style=\"color:#777;font-size:12px\">事件 ID：{}</p>",
         html_escape(detail),
-        item.event_id
+        html_escape(&item.event_id)
     );
     send_postmark(
         state,

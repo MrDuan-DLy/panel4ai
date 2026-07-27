@@ -210,12 +210,15 @@ function App() {
   }, [])
 
   useEffect(() => {
-    void refresh()
+    const initialRefresh = window.setTimeout(() => {
+      void refresh()
+    }, 0)
     const timer = window.setInterval(() => {
       void refresh()
     }, Math.max(15, settings.refreshIntervalSec) * 1000)
 
     return () => {
+      window.clearTimeout(initialRefresh)
       window.clearInterval(timer)
     }
   }, [refresh, settings.refreshIntervalSec])

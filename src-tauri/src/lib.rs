@@ -1221,10 +1221,7 @@ async fn refresh_claude_oauth_token(
 
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(format!(
-            "Failed to refresh Claude OAuth token: {status} — {body}"
-        ));
+        return Err(format!("Failed to refresh Claude OAuth token: {status}"));
     }
 
     response
@@ -1422,9 +1419,7 @@ fn persist_codex_auth_file(path: &Path, auth: &CodexAuthFile) -> Result<(), Stri
     }
 
     let content = serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?;
-    fs::write(path, content).map_err(|e| e.to_string())?;
-    set_file_permissions_600(path);
-    Ok(())
+    write_private_file(path, content.as_bytes())
 }
 
 fn read_claude_credentials_file(path: &Path) -> Result<ClaudeCredentialsFile, String> {
@@ -1451,19 +1446,32 @@ fn persist_claude_credentials_file(
     }
 
     let content = serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?;
-    fs::write(path, content).map_err(|e| e.to_string())?;
-    set_file_permissions_600(path);
-    Ok(())
+    write_private_file(path, content.as_bytes())
 }
 
 #[cfg(unix)]
-fn set_file_permissions_600(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+fn write_private_file(path: &Path, content: &[u8]) -> Result<(), String> {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|error| error.to_string())?;
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+        .map_err(|error| error.to_string())?;
+    file.set_len(0).map_err(|error| error.to_string())?;
+    file.write_all(content).map_err(|error| error.to_string())?;
+    file.sync_all().map_err(|error| error.to_string())
 }
 
 #[cfg(not(unix))]
-fn set_file_permissions_600(_path: &Path) {}
+fn write_private_file(path: &Path, content: &[u8]) -> Result<(), String> {
+    fs::write(path, content).map_err(|error| error.to_string())
+}
 
 fn candidate_codex_auth_paths() -> Vec<PathBuf> {
     let mut paths = Vec::new();
@@ -1520,9 +1528,7 @@ fn settings_path(app: &AppHandle) -> Result<PathBuf, String> {
 fn persist_settings(app: &AppHandle, settings: &AppSettings) -> Result<(), String> {
     let path = settings_path(app)?;
     let content = serde_json::to_string_pretty(settings).map_err(|e| e.to_string())?;
-    fs::write(&path, content).map_err(|e| e.to_string())?;
-    set_file_permissions_600(&path);
-    Ok(())
+    write_private_file(&path, content.as_bytes())
 }
 
 fn load_settings(app: &AppHandle) -> AppSettings {
@@ -1707,8 +1713,7 @@ async fn start_openai_oauth(
 
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(format!("Token exchange failed: {status} — {body}"));
+        return Err(format!("Token exchange failed: {status}"));
     }
 
     let token_response: OAuthRefreshResponse = response
@@ -1791,9 +1796,8 @@ async fn exchange_claude_auth_code(
 
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
         return Err(format!(
-            "Token exchange failed: {status} — {body} [code_len={}, endpoint={}]",
+            "Token exchange failed: {status} [code_len={}, endpoint={}]",
             actual_code.len(),
             CLAUDE_OAUTH_TOKEN_URL
         ));

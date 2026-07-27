@@ -66,6 +66,8 @@ alert_threshold_percent = 20.0
 EOF
 chown root:panel4ai /etc/panel4ai/server.toml /etc/panel4ai/postmark-token
 chmod 0640 /etc/panel4ai/server.toml /etc/panel4ai/postmark-token
+find /var/lib/panel4ai -maxdepth 1 -type f -name 'panel4ai.sqlite3*' \
+  -exec chmod 0600 {} +
 
 systemctl daemon-reload
 systemctl enable --now panel4ai-server.service
