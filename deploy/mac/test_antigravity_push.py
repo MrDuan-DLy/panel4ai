@@ -56,6 +56,17 @@ class ParseReport(unittest.TestCase):
             {'id': 'gemini-daily', 'window': 'daily', 'remaining_fraction': 0.5})
         self.assertEqual(len(push.parse_report(json.dumps(report))), 5)
 
+    def test_reset_time_with_any_fraction(self):
+        self.assertEqual(push.parse_reset('2026-11-04T18:28:16.123456789Z'), 1793816896)
+        self.assertEqual(push.parse_reset('2026-11-04T18:28:16.5Z'), 1793816896)
+
+    def test_malformed_bucket_is_reported_not_raised(self):
+        report = json.loads(json.dumps(REPORT))
+        report['command']['data']['groups'][0]['buckets'][0]['reset_time'] = 'soon'
+        with self.assertRaises(push.AgyError) as caught:
+            push.parse_report(json.dumps(report))
+        self.assertEqual(caught.exception.kind, 'invalid')
+
     def test_signed_out_report_is_classified_without_its_text(self):
         report = {'status': 'ERROR', 'response': 'Please sign in as someone@example.com'}
         with self.assertRaises(push.AgyError) as caught:

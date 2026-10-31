@@ -11,6 +11,7 @@ PANEL4AI_SERVER_URL. Only standard library, because launchd runs it with /usr/bi
 import datetime as dt
 import json
 import os
+import re
 import shutil
 import signal
 import stat
@@ -51,7 +52,9 @@ def scope_of(bucket_id):
 
 
 def parse_reset(value):
-    return int(dt.datetime.fromisoformat(value.replace('Z', '+00:00')).timestamp())
+    # launchd's Python 3.9 accepts only 3 or 6 fractional digits; whole seconds are enough here.
+    whole = re.sub(r'\.\d+', '', value).replace('Z', '+00:00')
+    return int(dt.datetime.fromisoformat(whole).timestamp())
 
 
 def parse_report(text):
@@ -68,22 +71,25 @@ def parse_report(text):
             raise AgyError('unauthorized', 'agy is not signed in; run agy on the Mac')
         raise AgyError('transport', f"agy usage report status: {report.get('status')}")
     windows = []
-    for group in (command.get('data') or {}).get('groups') or []:
-        for bucket in group.get('buckets') or []:
-            window = bucket.get('window')
-            bucket_id = bucket.get('id') or ''
-            scope = scope_of(bucket_id)
-            if window not in WINDOW_SECONDS or not scope:
-                continue
-            # Proto JSON omits zero, so an absent fraction on a live bucket means exhausted.
-            remaining = bucket.get('remaining_fraction', 0.0)
-            reset = bucket.get('reset_time')
-            windows.append({
-                'windowType': f'{WINDOW_BASE[window]}_{scope}',
-                'usedPercent': round(max(0.0, min(1.0, 1.0 - float(remaining))) * 100, 2),
-                'resetAt': parse_reset(reset) if reset else 0,
-                'windowSeconds': WINDOW_SECONDS[window],
-            })
+    try:
+        for group in (command.get('data') or {}).get('groups') or []:
+            for bucket in group.get('buckets') or []:
+                window = bucket.get('window')
+                bucket_id = bucket.get('id') or ''
+                scope = scope_of(bucket_id)
+                if window not in WINDOW_SECONDS or not scope:
+                    continue
+                # Proto JSON omits zero, so an absent fraction on a live bucket means exhausted.
+                remaining = bucket.get('remaining_fraction', 0.0)
+                reset = bucket.get('reset_time')
+                windows.append({
+                    'windowType': f'{WINDOW_BASE[window]}_{scope}',
+                    'usedPercent': round(max(0.0, min(1.0, 1.0 - float(remaining))) * 100, 2),
+                    'resetAt': parse_reset(reset) if reset else 0,
+                    'windowSeconds': WINDOW_SECONDS[window],
+                })
+    except (AttributeError, TypeError, ValueError):
+        raise AgyError('invalid', 'agy usage report has an unexpected shape') from None
     if not windows:
         raise AgyError('invalid', 'agy usage report has no known quota buckets')
     return windows
