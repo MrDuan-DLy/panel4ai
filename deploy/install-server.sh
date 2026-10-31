@@ -11,6 +11,7 @@ bind_addr=${PANEL4AI_BIND_ADDR:-127.0.0.1:8787}
 postmark_from="${PANEL4AI_POSTMARK_FROM:-Panel4AI <quota@example.com>}"
 postmark_to="${PANEL4AI_POSTMARK_TO:-you@example.com}"
 postmark_stream="${PANEL4AI_POSTMARK_STREAM:-outbound}"
+display_timezone="${PANEL4AI_TIMEZONE:-Asia/Shanghai}"
 
 if [[ ! -x ${binary} ]]; then
   echo "Server binary is missing or not executable: ${binary}" >&2
@@ -45,9 +46,18 @@ fi
 chown root:panel4ai /etc/panel4ai/api-token
 chmod 0640 /etc/panel4ai/api-token
 
-if [[ ! -e /etc/panel4ai/postmark-token ]]; then
-  install -m 0640 -o root -g panel4ai /dev/null /etc/panel4ai/postmark-token
+if [[ ! -s /etc/panel4ai/ingest-token ]]; then
+  umask 0027
+  openssl rand -hex 32 > /etc/panel4ai/ingest-token
 fi
+chown root:panel4ai /etc/panel4ai/ingest-token
+chmod 0640 /etc/panel4ai/ingest-token
+
+for secret in postmark-token bark-key; do
+  if [[ ! -e /etc/panel4ai/${secret} ]]; then
+    install -m 0640 -o root -g panel4ai /dev/null "/etc/panel4ai/${secret}"
+  fi
+done
 
 cat > /etc/panel4ai/server.toml <<EOF
 bind_addr = "${bind_addr}"
@@ -63,9 +73,16 @@ postmark_to = "${postmark_to}"
 postmark_message_stream = "${postmark_stream}"
 poll_interval_sec = 300
 alert_threshold_percent = 20.0
+enabled_providers = ["openai", "claude", "grok"]
+push_providers = ["antigravity"]
+grok_binary_path = "/var/lib/panel4ai/.grok/bin/grok"
+grok_home = "/var/lib/panel4ai/.grok"
+ingest_token_file = "/etc/panel4ai/ingest-token"
+bark_key_file = "/etc/panel4ai/bark-key"
+display_timezone = "${display_timezone}"
 EOF
-chown root:panel4ai /etc/panel4ai/server.toml /etc/panel4ai/postmark-token
-chmod 0640 /etc/panel4ai/server.toml /etc/panel4ai/postmark-token
+chown root:panel4ai /etc/panel4ai/server.toml /etc/panel4ai/postmark-token /etc/panel4ai/bark-key
+chmod 0640 /etc/panel4ai/server.toml /etc/panel4ai/postmark-token /etc/panel4ai/bark-key
 find /var/lib/panel4ai -maxdepth 1 -type f -name 'panel4ai.sqlite3*' \
   -exec chmod 0600 {} +
 

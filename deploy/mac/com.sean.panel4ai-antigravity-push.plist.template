@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.sean.panel4ai-antigravity-push</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>@REPO@/deploy/mac/antigravity_push.py</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PANEL4AI_SERVER_URL</key><string>@SERVER_URL@</string>
+    <key>PATH</key><string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>StartInterval</key><integer>600</integer>
+  <key>Nice</key><integer>10</integer>
+  <key>LowPriorityIO</key><true/>
+  <key>StandardErrorPath</key><string>@HOME@/.local/state/panel4ai/antigravity-push.log</string>
+</dict>
+</plist>

@@ -1,191 +1,93 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { getCurrentWindow } from '@tauri-apps/api/window'
-import type { AppSettings, OAuthStatus, UsageSnapshot } from './types'
+import type { AppSettings, UsageReport } from './types'
+import {
+  formatDuration,
+  groupReport,
+  mostUsedWindow,
+  panelHeightFor,
+  resetText,
+  trayStatus,
+  windowLabel,
+  worstStatus,
+} from './usage'
 import './App.css'
 
-const CLAUDE_OAUTH_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e'
-const CLAUDE_OAUTH_REDIRECT_URI = 'https://platform.claude.com/oauth/code/callback'
-const CLAUDE_OAUTH_SCOPES = 'user:profile user:inference user:sessions:claude_code'
-
 const defaultSettings: AppSettings = {
-  provider: 'openai_oauth',
   refreshIntervalSec: 120,
   alertThresholdPercent: 20,
   collapseDelayMs: 0,
   autoStart: true,
   dockPosition: 'top-right',
-  selectedWindowType: 'hourly5',
-  codexAuthPath: '',
-  claudeAuthPath: '',
-  dataSource: 'remote_fallback',
   serverUrl: 'http://127.0.0.1:8787',
   serverApiToken: '',
-  limitsByWindow: {
-    weekly: 100,
-    hourly5: 100,
-  },
 }
 
-const defaultOAuthStatus: OAuthStatus = {
-  available: false,
-  source: 'none',
-  message: 'Checking OAuth status...',
+const emptyReport: UsageReport = { serverTime: 0, lastPollAt: null, snapshots: [] }
+
+function fmtTime(epochSec: number | null): string {
+  if (!epochSec || epochSec <= 0) return '--'
+  return new Date(epochSec * 1000).toLocaleTimeString()
 }
 
-function fmtTime(epochSec: number): string {
-  if (epochSec <= 0) return 'Unknown'
-  return new Date(epochSec * 1000).toLocaleString()
-}
-
-function base64urlEncode(buffer: Uint8Array): string {
-  let binary = ''
-  for (const byte of buffer) {
-    binary += String.fromCharCode(byte)
-  }
-  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '')
-}
-
-type DisplayStatus = 'ok' | 'warning' | 'danger' | 'error' | 'cached'
-
-function getWorstDisplayStatus(items: UsageSnapshot[]): DisplayStatus {
-  const statuses = items.map((item) => item.status)
-  if (statuses.includes('danger')) return 'danger'
-  if (statuses.includes('error')) return 'error'
-  if (statuses.includes('warning')) return 'warning'
-  if (statuses.includes('cached')) return 'cached'
-  return 'ok'
-}
-
-function getTrayStatus(items: UsageSnapshot[]): 'ok' | 'warning' | 'danger' {
-  const worst = getWorstDisplayStatus(items)
-  if (worst === 'danger') return 'danger'
-  if (worst === 'warning' || worst === 'error' || worst === 'cached') return 'warning'
-  return 'ok'
+function isConfigured(settings: AppSettings): boolean {
+  return settings.serverUrl.trim() !== '' && settings.serverApiToken.trim() !== ''
 }
 
 function App() {
-  const [platform, setPlatform] = useState('windows')
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [settings, setSettings] = useState<AppSettings>(defaultSettings)
-  const [oauthStatus, setOauthStatus] = useState<OAuthStatus>(defaultOAuthStatus)
-  const [snapshots, setSnapshots] = useState<UsageSnapshot[]>([])
-  const snapshotsRef = useRef<UsageSnapshot[]>([])
+  const [savedSettings, setSavedSettings] = useState<AppSettings | null>(null)
+  const [report, setReport] = useState<UsageReport>(emptyReport)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const [testEmailStatus, setTestEmailStatus] = useState('')
 
-  // Claude OAuth login state
-  const [claudeLoginStep, setClaudeLoginStep] = useState<'idle' | 'waiting' | 'exchanging' | 'success'>('idle')
-  const claudeLoginStepRef = useRef(claudeLoginStep)
-  const [claudeAuthCode, setClaudeAuthCode] = useState('')
-  const [claudeLoginError, setClaudeLoginError] = useState('')
-  const [codeVerifier, setCodeVerifier] = useState('')
-  const [oauthState, setOauthState] = useState('')
+  const groups = useMemo(() => groupReport(report), [report])
+  const status = useMemo(() => worstStatus(groups), [groups])
+  const configured = savedSettings !== null && isConfigured(savedSettings)
+  const nowSec = report.serverTime || Date.now() / 1000
 
-  // OpenAI OAuth login state
-  const [openaiLoginStep, setOpenaiLoginStep] = useState<'idle' | 'logging_in' | 'success'>('idle')
-  const openaiLoginStepRef = useRef(openaiLoginStep)
-  const [openaiLoginError, setOpenaiLoginError] = useState('')
-
-  // Keep refs in sync for use in blur handler
-  useEffect(() => { claudeLoginStepRef.current = claudeLoginStep }, [claudeLoginStep])
-  useEffect(() => { openaiLoginStepRef.current = openaiLoginStep }, [openaiLoginStep])
-  useEffect(() => { snapshotsRef.current = snapshots }, [snapshots])
-
-  // Calculate worst status across all providers
-  const worstStatus = useMemo(() => getWorstDisplayStatus(snapshots), [snapshots])
-
-  // Calculate panel height dynamically
   const panelHeight = useMemo(() => {
-    if (settingsOpen) return 540
-    const cardCount = snapshots.length || 1
-    let h = 58 + cardCount * 120 + 24 + 20
-    if (!oauthStatus.available) h += 70
-    if (error) h += 45
-    return Math.max(200, h)
-  }, [settingsOpen, snapshots.length, oauthStatus.available, error])
+    if (settingsOpen) return 420
+    return panelHeightFor(groups) + (error ? 45 : 0) + (configured ? 0 : 70)
+  }, [settingsOpen, groups, error, configured])
 
-  // Resize panel when content changes
   useEffect(() => {
     void invoke('resize_panel', { height: panelHeight })
   }, [panelHeight])
 
   const refresh = useCallback(async () => {
-    if (!oauthStatus.available) return
-
     setLoading(true)
     setError('')
     try {
-      const results = await invoke<UsageSnapshot[]>('get_all_usage_snapshots')
-      const prevByKey = new Map<string, UsageSnapshot>()
-      for (const snapshot of snapshotsRef.current) {
-        if (snapshot.status !== 'error') {
-          prevByKey.set(snapshot.provider.startsWith('openai') ? 'openai' : 'claude', snapshot)
-        }
-      }
-
-      const displayed = results.map((snap) => {
-        if (snap.status === 'error') {
-          const key = snap.provider.startsWith('openai') ? 'openai' : 'claude'
-          const cached = prevByKey.get(key)
-          if (cached) {
-            return { ...cached, status: 'cached', message: `(cached) ${snap.message ?? 'rate limited'}` }
-          }
-        }
-        return snap
-      })
-
-      snapshotsRef.current = displayed
-      setSnapshots(displayed)
-      await invoke('update_tray_status', { status: getTrayStatus(displayed) })
-
-      const worstSnap = results
-        .filter((s) => s.status !== 'error')
-        .sort((a, b) => a.remainingPercent - b.remainingPercent)[0]
-      if (worstSnap) {
-        await invoke('notify_if_needed', { snapshot: worstSnap })
+      const next = await invoke<UsageReport>('get_usage_report')
+      setReport(next)
+      const nextGroups = groupReport(next)
+      await invoke('update_tray_status', { status: trayStatus(worstStatus(nextGroups)) })
+      const lowest = mostUsedWindow(nextGroups)
+      if (lowest) {
+        await invoke('notify_if_needed', { snapshot: lowest })
       }
     } catch (e) {
+      // Keep the last report on screen: old numbers with a visible error beat none.
       setError(String(e))
+      await invoke('update_tray_status', { status: 'warning' })
     } finally {
       setLoading(false)
     }
-  }, [oauthStatus.available])
-
-  const loadSettings = async (): Promise<AppSettings | null> => {
-    try {
-      const s = await invoke<AppSettings>('get_settings')
-      setSettings(s)
-      return s
-    } catch (e) {
-      setError(String(e))
-      return null
-    }
-  }
-
-  const loadOAuthStatus = async () => {
-    try {
-      const status = await invoke<OAuthStatus>('get_oauth_status')
-      setOauthStatus(status)
-      if (!status.available) {
-        setSnapshots([])
-      }
-    } catch (e) {
-      setOauthStatus({
-        available: false,
-        source: 'none',
-        message: String(e),
-      })
-    }
-  }
+  }, [])
 
   useEffect(() => {
     const init = async () => {
-      const p = await invoke<string>('get_platform')
-      setPlatform(p)
-      await loadSettings()
-      await loadOAuthStatus()
+      try {
+        const loaded = await invoke<AppSettings>('get_settings')
+        setSettings(loaded)
+        setSavedSettings(loaded)
+      } catch (e) {
+        setError(String(e))
+      }
     }
     void init()
 
@@ -194,9 +96,6 @@ function App() {
       if (!focused) {
         setTimeout(() => {
           if (!document.hasFocus()) {
-            // Don't auto-hide during OAuth login flow — user needs to paste the code
-            if (claudeLoginStepRef.current === 'waiting') return
-            if (openaiLoginStepRef.current === 'logging_in') return
             void invoke('hide_panel')
             setSettingsOpen(false)
           }
@@ -210,30 +109,26 @@ function App() {
   }, [])
 
   useEffect(() => {
+    if (!configured || savedSettings === null) return
     const initialRefresh = window.setTimeout(() => {
       void refresh()
     }, 0)
     const timer = window.setInterval(() => {
       void refresh()
-    }, Math.max(15, settings.refreshIntervalSec) * 1000)
+    }, Math.max(15, savedSettings.refreshIntervalSec) * 1000)
 
     return () => {
       window.clearTimeout(initialRefresh)
       window.clearInterval(timer)
     }
-  }, [refresh, settings.refreshIntervalSec])
-
-  const toggleSettings = () => {
-    setSettingsOpen((prev) => !prev)
-  }
+  }, [refresh, configured, savedSettings])
 
   const saveSettings = async () => {
     try {
       const saved = await invoke<AppSettings>('save_settings', { settings })
       setSettings(saved)
-      await loadOAuthStatus()
+      setSavedSettings(saved)
       setError('')
-      await refresh()
     } catch (e) {
       setError(String(e))
     }
@@ -249,126 +144,9 @@ function App() {
     }
   }
 
-  const startClaudeLogin = async () => {
-    try {
-      setClaudeLoginError('')
-      const array = new Uint8Array(32)
-      crypto.getRandomValues(array)
-      const verifier = base64urlEncode(array)
-      setCodeVerifier(verifier)
-
-      const digest = await crypto.subtle.digest(
-        'SHA-256',
-        new TextEncoder().encode(verifier),
-      )
-      const challenge = base64urlEncode(new Uint8Array(digest))
-
-      const stateArray = new Uint8Array(32)
-      crypto.getRandomValues(stateArray)
-      const state = base64urlEncode(stateArray)
-      setOauthState(state)
-
-      const params = new URLSearchParams({
-        code: 'true',
-        client_id: CLAUDE_OAUTH_CLIENT_ID,
-        response_type: 'code',
-        redirect_uri: CLAUDE_OAUTH_REDIRECT_URI,
-        scope: CLAUDE_OAUTH_SCOPES,
-        code_challenge: challenge,
-        code_challenge_method: 'S256',
-        state,
-      })
-
-      const authUrl = `https://claude.ai/oauth/authorize?${params.toString()}`
-      await invoke('open_external_url', { url: authUrl })
-      setClaudeLoginStep('waiting')
-    } catch (e) {
-      setClaudeLoginError(String(e))
-    }
-  }
-
-  const submitClaudeCode = async () => {
-    try {
-      setClaudeLoginError('')
-      setClaudeLoginStep('exchanging')
-
-      let code = claudeAuthCode.trim()
-      // Allow pasting the full callback URL
-      const urlMatch = code.match(/[?&]code=([^&#]+)/)
-      if (urlMatch) {
-        code = urlMatch[1]
-      }
-      // Handle CODE#STATE format — strip the #state suffix
-      const hashIdx = code.indexOf('#')
-      if (hashIdx > 0) {
-        code = code.substring(0, hashIdx)
-      }
-
-      await invoke('exchange_claude_auth_code', { code, codeVerifier, oauthState })
-      setClaudeLoginStep('success')
-      setClaudeAuthCode('')
-      await loadOAuthStatus()
-      await refresh()
-      setTimeout(() => setClaudeLoginStep('idle'), 3000)
-    } catch (e) {
-      setClaudeLoginStep('waiting')
-      setClaudeLoginError(String(e))
-    }
-  }
-
-  const startOpenAILogin = async () => {
-    try {
-      setOpenaiLoginError('')
-      setOpenaiLoginStep('logging_in')
-
-      const array = new Uint8Array(32)
-      crypto.getRandomValues(array)
-      const verifier = base64urlEncode(array)
-
-      const digest = await crypto.subtle.digest(
-        'SHA-256',
-        new TextEncoder().encode(verifier),
-      )
-      const challenge = base64urlEncode(new Uint8Array(digest))
-
-      const stateArray = new Uint8Array(32)
-      crypto.getRandomValues(stateArray)
-      const state = base64urlEncode(stateArray)
-
-      await invoke('start_openai_oauth', {
-        codeChallenge: challenge,
-        codeVerifier: verifier,
-        oauthState: state,
-      })
-
-      setOpenaiLoginStep('success')
-      await loadOAuthStatus()
-      await refresh()
-      setTimeout(() => setOpenaiLoginStep('idle'), 3000)
-    } catch (e) {
-      setOpenaiLoginStep('idle')
-      setOpenaiLoginError(String(e))
-    }
-  }
-
-  const windowLabel = useMemo(() => {
-    const m: Record<string, string> = {
-      hourly5: 'Current Session',
-      weekly: 'Weekly (7d)',
-      code_review_weekly: 'Code Review (7d)',
-    }
-    return m[settings.selectedWindowType] ?? settings.selectedWindowType
-  }, [settings.selectedWindowType])
-
-  const lastUpdated = useMemo(() => {
-    const ts = snapshots.filter((s) => s.status !== 'error').map((s) => s.updatedAt)
-    if (ts.length === 0) return '--'
-    return fmtTime(Math.max(...ts))
-  }, [snapshots])
-
   return (
     <div
-      className={`panel ${worstStatus}`}
+      className={`panel ${status}`}
       onMouseEnter={() => void invoke('panel_mouse_enter')}
       onMouseLeave={() => void invoke('panel_mouse_leave')}
     >
@@ -376,68 +154,62 @@ function App() {
         <div className="header">
           <div>
             <h1>AI Usage Monitor</h1>
-            <p>{windowLabel} &middot; {settings.refreshIntervalSec}s</p>
+            <p>Server polled {fmtTime(report.lastPollAt)}</p>
           </div>
-          <button type="button" className="ghost" onClick={toggleSettings}>
+          <button type="button" className="ghost" onClick={() => setSettingsOpen((prev) => !prev)}>
             {settingsOpen ? 'Back' : 'Settings'}
           </button>
         </div>
 
         {!settingsOpen && (
           <>
-            {snapshots.length === 0 && !loading && oauthStatus.available && (
+            {configured && groups.length === 0 && !loading && !error && (
               <div className="card muted">No usage data yet...</div>
             )}
 
-            {snapshots.map((snap, i) => (
-              <div key={i} className={`card ${snap.status === 'error' ? 'card-error' : ''} ${snap.status === 'cached' ? 'card-cached' : ''}`}>
+            {groups.map((group) => (
+              <div key={group.key} className={`card ${group.error ? 'card-error' : ''} ${group.stale ? 'card-cached' : ''}`}>
                 <div className="row">
-                  <span className="provider-name">{snap.provider}</span>
-                  {snap.status !== 'error' && (
-                    <strong>
-                      {snap.used.toFixed(1)}% used
-                      {snap.status === 'cached' && <span className="cached-badge"> (stale)</span>}
-                    </strong>
+                  <span className="provider-name">
+                    {group.name}
+                    {group.plan && <span className="plan-tag"> {group.plan}</span>}
+                  </span>
+                  {group.stale && (
+                    <span className="cached-badge">
+                      {group.lastPushAt > 0
+                        ? `stale ${formatDuration(nowSec - group.lastPushAt)}`
+                        : 'no data yet'}
+                    </span>
                   )}
                 </div>
-                {snap.status === 'error' ? (
-                  <div className="card-error-msg">{snap.message}</div>
-                ) : (
-                  <>
+                {group.error && <div className="card-error-msg">{group.error}</div>}
+                {group.windows.map((window) => (
+                  <div key={window.windowType} className="window">
+                    <div className="meta">
+                      <span className="window-name">{windowLabel(window.windowType)}</span>
+                      <strong>{Math.round(window.used)}% used</strong>
+                    </div>
                     <div className="bar">
                       <div
-                        className={`bar-fill ${snap.status === 'cached' ? 'warning' : snap.status}`}
-                        style={{
-                          width: `${Math.max(0, Math.min(100, snap.used))}%`,
-                        }}
+                        className={`bar-fill ${window.status}`}
+                        style={{ width: `${Math.max(0, Math.min(100, window.used))}%` }}
                       />
                     </div>
-                    <div className="meta">
-                      <span>
-                        Used: {snap.used.toFixed(1)} / {snap.limit.toFixed(0)}
-                      </span>
-                      <span>Reset: {fmtTime(snap.resetAt)}</span>
-                    </div>
-                    {snap.status === 'cached' && snap.message && (
-                      <div className="cached-msg">{snap.message}</div>
-                    )}
-                  </>
-                )}
+                    <div className="meta reset-text">{resetText(window, nowSec)}</div>
+                  </div>
+                ))}
               </div>
             ))}
 
             <div className="status-row">
-              {loading ? 'Refreshing...' : `Updated: ${lastUpdated}`}
-              <span className="version-tag">v0.1.11</span>
+              {loading ? 'Refreshing...' : `Updated: ${fmtTime(report.serverTime)}`}
+              <span className="version-tag">v0.2.0</span>
             </div>
 
-            {!oauthStatus.available && (
+            {savedSettings !== null && !configured && (
               <div className="warning">
-                <p>No OAuth providers found.</p>
-                <p>{oauthStatus.message}</p>
-                <button type="button" onClick={() => void loadOAuthStatus()}>
-                  Retry
-                </button>
+                <p>Server is not configured.</p>
+                <p>Open Settings and enter the server URL and access token.</p>
               </div>
             )}
           </>
@@ -446,120 +218,28 @@ function App() {
         {settingsOpen && (
           <div className="settings">
             <label>
-              Data source
-              <select
-                value={settings.dataSource}
-                onChange={(e) => setSettings({ ...settings, dataSource: e.target.value })}
-              >
-                <option value="remote">VPS only</option>
-                <option value="remote_fallback">VPS with local fallback</option>
-                <option value="local">Local OAuth only</option>
-              </select>
-            </label>
-            {settings.dataSource !== 'local' && (
-              <>
-                <label>
-                  VPS URL
-                  <input
-                    type="text"
-                    value={settings.serverUrl}
-                    onChange={(e) => setSettings({ ...settings, serverUrl: e.target.value })}
-                    placeholder="http://100.x.y.z:8787"
-                  />
-                </label>
-                <label>
-                  VPS access token
-                  <input
-                    type="password"
-                    value={settings.serverApiToken}
-                    onChange={(e) => setSettings({ ...settings, serverApiToken: e.target.value })}
-                    placeholder="Stored only in the local app config"
-                    autoComplete="off"
-                  />
-                </label>
-                <button type="button" className="secondary-btn" onClick={() => void sendTestEmail()}>
-                  Send test email
-                </button>
-                {testEmailStatus && <p className="settings-status">{testEmailStatus}</p>}
-              </>
-            )}
-            <label>
-              Codex auth path (optional)
+              Server URL
               <input
                 type="text"
-                value={settings.codexAuthPath}
-                onChange={(e) =>
-                  setSettings({ ...settings, codexAuthPath: e.target.value })
-                }
-                placeholder={platform === 'macos' ? '~/.codex/auth.json' : 'C:\\Users\\you\\.codex\\auth.json'}
+                value={settings.serverUrl}
+                onChange={(e) => setSettings({ ...settings, serverUrl: e.target.value })}
+                placeholder="http://100.x.y.z:8787"
               />
             </label>
-            <div className="login-section">
-              {openaiLoginStep === 'idle' && (
-                <button type="button" className="login-btn" onClick={() => void startOpenAILogin()}>
-                  Login with OpenAI
-                </button>
-              )}
-              {openaiLoginStep === 'logging_in' && (
-                <p className="login-hint">Waiting for browser login...</p>
-              )}
-              {openaiLoginStep === 'success' && (
-                <p className="login-success">OpenAI login successful!</p>
-              )}
-              {openaiLoginError && <p className="login-error">{openaiLoginError}</p>}
-            </div>
-
             <label>
-              Claude auth path (optional)
+              Access token
               <input
-                type="text"
-                value={settings.claudeAuthPath}
-                onChange={(e) =>
-                  setSettings({ ...settings, claudeAuthPath: e.target.value })
-                }
-                placeholder={platform === 'macos' ? '~/.claude/.credentials.json' : 'C:\\Users\\you\\.claude\\.credentials.json'}
+                type="password"
+                value={settings.serverApiToken}
+                onChange={(e) => setSettings({ ...settings, serverApiToken: e.target.value })}
+                placeholder="Stored only in the local app config"
+                autoComplete="off"
               />
             </label>
-
-            <div className="login-section">
-              {claudeLoginStep === 'idle' && (
-                <button type="button" className="login-btn" onClick={() => void startClaudeLogin()}>
-                  Login with Claude
-                </button>
-              )}
-              {claudeLoginStep === 'waiting' && (
-                <>
-                  <p className="login-hint">Paste the code from the browser callback page:</p>
-                  <input
-                    type="text"
-                    value={claudeAuthCode}
-                    onChange={(e) => setClaudeAuthCode(e.target.value)}
-                    placeholder="Paste code or callback URL"
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter' && claudeAuthCode.trim()) {
-                        void submitClaudeCode()
-                      }
-                    }}
-                  />
-                  <div className="login-actions">
-                    <button type="button" onClick={() => void submitClaudeCode()} disabled={!claudeAuthCode.trim()}>
-                      Submit
-                    </button>
-                    <button type="button" className="ghost" onClick={() => { setClaudeLoginStep('idle'); setClaudeLoginError('') }}>
-                      Cancel
-                    </button>
-                  </div>
-                </>
-              )}
-              {claudeLoginStep === 'exchanging' && (
-                <p className="login-hint">Exchanging code for tokens...</p>
-              )}
-              {claudeLoginStep === 'success' && (
-                <p className="login-success">Claude login successful!</p>
-              )}
-              {claudeLoginError && <p className="login-error">{claudeLoginError}</p>}
-            </div>
-
+            <button type="button" className="secondary-btn" onClick={() => void sendTestEmail()}>
+              Send test email
+            </button>
+            {testEmailStatus && <p className="settings-status">{testEmailStatus}</p>}
             <label>
               Refresh interval (sec)
               <input
@@ -585,25 +265,6 @@ function App() {
                   })
                 }
               />
-            </label>
-            <label>
-              Usage window
-              <select
-                value={settings.selectedWindowType}
-                onChange={(e) =>
-                  setSettings({
-                    ...settings,
-                    selectedWindowType: e.target.value as
-                      | 'hourly5'
-                      | 'weekly'
-                      | 'code_review_weekly',
-                  })
-                }
-              >
-                <option value="hourly5">Current Session</option>
-                <option value="weekly">Weekly (7-day)</option>
-                <option value="code_review_weekly">Code Review (7-day)</option>
-              </select>
             </label>
             <label className="checkbox">
               <input

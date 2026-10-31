@@ -1,4 +1,4 @@
-﻿export type UsageSnapshot = {
+export type UsageSnapshot = {
   provider: string
   windowType: string
   windowStart: number
@@ -12,24 +12,20 @@
   message?: string | null
 }
 
+export type UsageReport = {
+  serverTime: number
+  lastPollAt: number | null
+  snapshots: UsageSnapshot[]
+  providerErrors?: Record<string, string>
+  staleProviders?: Record<string, number>
+}
+
 export type AppSettings = {
-  provider: 'openai_oauth' | 'claude_oauth' | string
   refreshIntervalSec: number
   alertThresholdPercent: number
   collapseDelayMs: number
   autoStart: boolean
   dockPosition: string
-  selectedWindowType: 'hourly5' | 'weekly' | 'code_review_weekly' | string
-  codexAuthPath: string
-  claudeAuthPath: string
-  dataSource: 'remote' | 'local' | 'remote_fallback' | string
   serverUrl: string
   serverApiToken: string
-  limitsByWindow: Record<string, number>
-}
-
-export type OAuthStatus = {
-  available: boolean
-  source: string
-  message?: string | null
 }
