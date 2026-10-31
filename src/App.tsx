@@ -47,7 +47,8 @@ function App() {
   const groups = useMemo(() => groupReport(report), [report])
   const status = useMemo(() => worstStatus(groups), [groups])
   const configured = savedSettings !== null && isConfigured(savedSettings)
-  const nowSec = report.serverTime || Date.now() / 1000
+  // Countdowns use the report's own clock, so a Mac with a wrong clock still reads true.
+  const nowSec = report.serverTime
 
   const panelHeight = useMemo(() => {
     if (settingsOpen) return 420
