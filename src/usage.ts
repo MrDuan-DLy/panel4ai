@@ -150,8 +150,8 @@ export function resetText(window: UsageSnapshot, nowSec: number): string {
 
 export function panelHeightFor(groups: ProviderGroup[]): number {
   const content = groups.reduce(
-    (height, group) => height + 36 + group.windows.length * 42 + (group.error ? 22 : 0),
+    (height, group) => height + 36 + group.windows.length * 47 + (group.error ? 22 : 0),
     0,
   )
-  return Math.min(720, Math.max(200, 58 + content + groups.length * 8 + 34))
+  return Math.min(720, Math.max(200, 58 + content + groups.length * 8 + 46))
 }

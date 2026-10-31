@@ -4,14 +4,11 @@ pub use panel4ai_core::UsageSnapshot;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{
-    AppHandle, LogicalPosition, LogicalSize, Manager, PhysicalPosition, PhysicalSize, Position,
-    Size, State,
-};
+use tauri::{AppHandle, LogicalPosition, LogicalSize, Manager, Position, Size, State};
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt as AutoStartExt};
 use tauri_plugin_notification::NotificationExt;
 
@@ -54,6 +51,7 @@ struct AppState {
     panel_pinned: AtomicBool,
     panel_hovered: AtomicBool,
     hover_generation: AtomicU64,
+    panel_height: AtomicU32,
 }
 
 #[tauri::command]
@@ -125,43 +123,50 @@ fn panel_mouse_leave(app: AppHandle, state: State<'_, AppState>) {
 }
 
 #[tauri::command]
-fn resize_panel(app: AppHandle, height: u32) -> Result<(), String> {
+fn resize_panel(app: AppHandle, state: State<'_, AppState>, height: u32) -> Result<(), String> {
+    state.panel_height.store(height, Ordering::Relaxed);
     let window = app
         .get_webview_window(MAIN_WINDOW_LABEL)
         .ok_or_else(|| "Main window not found".to_string())?;
 
-    let current_pos = window.outer_position().map_err(|e| e.to_string())?;
-    let current_size = window.outer_size().map_err(|e| e.to_string())?;
+    let scale = window.scale_factor().map_err(|e| e.to_string())?;
+    let position = window
+        .outer_position()
+        .map_err(|e| e.to_string())?
+        .to_logical::<f64>(scale);
+    let current_height = window
+        .outer_size()
+        .map_err(|e| e.to_string())?
+        .to_logical::<f64>(scale)
+        .height;
 
-    let mut new_x = current_pos.x;
-    let mut new_y = if cfg!(target_os = "macos") {
-        // macOS: anchor top edge, grow downward
-        current_pos.y
+    let panel_h = height as f64;
+    // macOS anchors the top edge and grows downward; Windows anchors the bottom edge.
+    let y = if cfg!(target_os = "macos") {
+        position.y
     } else {
-        // Windows: anchor bottom edge, grow upward
-        let bottom_y = current_pos.y + current_size.height as i32;
-        bottom_y - height as i32
+        position.y + current_height - panel_h
     };
-
-    if let Ok(Some(mon)) = window.current_monitor() {
-        let mp = mon.position();
-        let sz = mon.size();
-        let left = mp.x;
-        let top = mp.y;
-        let right = left + sz.width as i32;
-        let bottom = top + sz.height as i32;
-        let margin = 4;
-        new_x = new_x.clamp(left + margin, right - PANEL_WIDTH as i32 - margin);
-        new_y = new_y.clamp(top + margin, bottom - height as i32 - margin);
-    }
-
-    window
-        .set_size(Size::Physical(PhysicalSize::new(PANEL_WIDTH, height)))
-        .map_err(|e| e.to_string())?;
-    window
-        .set_position(Position::Physical(PhysicalPosition::new(new_x, new_y)))
-        .map_err(|e| e.to_string())?;
+    place_panel(&window, position.x, y, panel_h);
     Ok(())
+}
+
+/// Sizes and moves the panel in logical units, keeping it on the current monitor.
+fn place_panel(window: &tauri::WebviewWindow, mut x: f64, mut y: f64, panel_h: f64) {
+    let panel_w = PANEL_WIDTH as f64;
+    const MARGIN: f64 = 4.0;
+    if let Ok(Some(monitor)) = window.current_monitor() {
+        let scale = monitor.scale_factor();
+        let left = monitor.position().x as f64 / scale;
+        let top = monitor.position().y as f64 / scale;
+        let right = left + monitor.size().width as f64 / scale;
+        let bottom = top + monitor.size().height as f64 / scale;
+        // min before max, so a panel taller than the screen pins to its top edge.
+        x = x.min(right - panel_w - MARGIN).max(left + MARGIN);
+        y = y.min(bottom - panel_h - MARGIN).max(top + MARGIN);
+    }
+    let _ = window.set_size(Size::Logical(LogicalSize::new(panel_w, panel_h)));
+    let _ = window.set_position(Position::Logical(LogicalPosition::new(x, y)));
 }
 
 #[tauri::command]
@@ -418,29 +423,14 @@ fn position_panel_near_tray(window: &tauri::WebviewWindow, tray_rect: &tauri::Re
         Size::Logical(s) => s.height,
     };
 
-    let panel_w = PANEL_WIDTH as f64;
     let panel_h = height as f64;
-    let mut x = tx - panel_w / 2.0;
-    let mut y = if cfg!(target_os = "macos") {
+    let x = tx - PANEL_WIDTH as f64 / 2.0;
+    let y = if cfg!(target_os = "macos") {
         ty + tray_h + 4.0
     } else {
         ty - panel_h - 8.0
     };
-
-    if let Ok(Some(mon)) = window.current_monitor() {
-        let ms = mon.scale_factor();
-        let mp = mon.position();
-        let sz = mon.size();
-        let left = mp.x as f64 / ms;
-        let top = mp.y as f64 / ms;
-        let right = left + sz.width as f64 / ms;
-        let bottom = top + sz.height as f64 / ms;
-        x = x.clamp(left + 4.0, right - panel_w - 4.0);
-        y = y.clamp(top + 4.0, bottom - panel_h - 4.0);
-    }
-
-    let _ = window.set_size(Size::Logical(LogicalSize::new(panel_w, panel_h)));
-    let _ = window.set_position(Position::Logical(LogicalPosition::new(x, y)));
+    place_panel(window, x, y, panel_h);
 }
 
 fn show_panel_preview(app: &AppHandle, rect: &tauri::Rect) {
@@ -450,7 +440,7 @@ fn show_panel_preview(app: &AppHandle, rect: &tauri::Rect) {
     if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
         let pinned = state.panel_pinned.load(Ordering::Relaxed);
         if !pinned {
-            position_panel_near_tray(&window, rect, PANEL_HEIGHT);
+            position_panel_near_tray(&window, rect, state.panel_height.load(Ordering::Relaxed));
         }
         if !window.is_visible().unwrap_or(false) {
             let _ = window.show();
@@ -527,7 +517,11 @@ fn setup_tray(app: &tauri::App) -> Result<(), String> {
                         } else {
                             state.panel_pinned.store(true, Ordering::Relaxed);
                             if !window.is_visible().unwrap_or(false) {
-                                position_panel_near_tray(&window, &rect, PANEL_HEIGHT);
+                                position_panel_near_tray(
+                                    &window,
+                                    &rect,
+                                    state.panel_height.load(Ordering::Relaxed),
+                                );
                                 let _ = window.show();
                                 #[cfg(target_os = "macos")]
                                 order_macos_panel_front(&window);
@@ -560,6 +554,7 @@ pub fn run() {
             panel_pinned: AtomicBool::new(false),
             panel_hovered: AtomicBool::new(false),
             hover_generation: AtomicU64::new(0),
+            panel_height: AtomicU32::new(PANEL_HEIGHT),
         })
         .plugin(tauri_plugin_log::Builder::default().build())
         .plugin(tauri_plugin_notification::init())
