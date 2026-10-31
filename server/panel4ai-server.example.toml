@@ -11,3 +11,28 @@ postmark_to = "you@example.com"
 postmark_message_stream = "outbound"
 poll_interval_sec = 300
 alert_threshold_percent = 20.0
+
+# Polled from this server: openai, claude, grok.
+enabled_providers = ["openai", "claude", "grok"]
+# Pushed by another machine through POST /api/v1/ingest/<name>.
+push_providers = ["antigravity"]
+grok_binary_path = "/var/lib/panel4ai/.grok/bin/grok"
+grok_home = "/var/lib/panel4ai/.grok"
+ingest_token_file = "/etc/panel4ai/ingest-token"
+bark_key_file = "/etc/panel4ai/bark-key"
+bark_server = "https://api.day.app"
+# Used for the times in emails and pushes.
+display_timezone = "Asia/Shanghai"
+# A pusher counts as stale after an hour and raises one alert after a day.
+push_stale_after_sec = 3600
+push_stale_alert_after_sec = 86400
+
+# Optional per-provider poll interval, at least 60 seconds.
+# [provider_intervals]
+# grok = 600
+
+# Scheduled resets of 5-hour windows. Weekly and monthly resets, early resets, plan
+# changes and monitoring alerts always go to both email and Bark.
+[notify]
+short_window_email = false
+short_window_bark_below_remaining = 50.0

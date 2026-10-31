@@ -119,12 +119,6 @@ body,
   font-weight: 400;
 }
 
-.cached-msg {
-  font-size: 10px;
-  color: #9a7a1c;
-  margin-top: 2px;
-}
-
 .provider-name {
   font-size: 12px;
   color: #3d4b64;
@@ -152,9 +146,29 @@ body,
   white-space: nowrap;
 }
 
-.row strong {
-  font-size: 16px;
+.plan-tag {
+  color: #7a8caa;
+  font-weight: 400;
+}
+
+.window {
+  margin-top: 6px;
+}
+
+.window .meta strong {
+  font-size: 12px;
+  font-weight: 600;
   white-space: nowrap;
+}
+
+.window .bar {
+  margin: 3px 0;
+  height: 6px;
+}
+
+.reset-text {
+  color: #6b7c99;
+  font-size: 10px;
 }
 
 .bar {
@@ -193,33 +207,24 @@ body,
   font-weight: 500;
 }
 
-.warning,
+.banner-warning,
 .settings,
-.error {
+.banner-error {
   border-radius: 10px;
   padding: 10px;
   font-size: 12px;
 }
 
-.warning {
+.banner-warning {
   border: 1px solid #d4b34d;
   background: #fff6de;
 }
 
-.warning p {
+.banner-warning p {
   margin: 0 0 4px;
 }
 
-.warning button {
-  margin-top: 4px;
-  border: 1px solid #b09838;
-  background: #f5e7a6;
-  border-radius: 6px;
-  padding: 4px 10px;
-  cursor: pointer;
-}
-
-.error {
+.banner-error {
   border: 1px solid #d14343;
   background: #ffe6e6;
   color: #7a1c1c;
@@ -243,8 +248,7 @@ body,
   font-size: 12px;
 }
 
-.settings input,
-.settings select {
+.settings input {
   padding: 5px 6px;
   border: 1px solid #c1cfe9;
   border-radius: 6px;
@@ -279,71 +283,6 @@ body,
   align-items: center;
 }
 
-.login-section {
-  border: 1px solid #c6d4ef;
-  border-radius: 8px;
-  padding: 8px;
-  background: #f0f4fc;
-}
-
-.login-btn {
-  width: 100%;
-  padding: 6px;
-  border: 1px solid #3d67b2;
-  color: #fff;
-  background: #3d67b2;
-  border-radius: 6px;
-  cursor: pointer;
-  font-size: 12px;
-}
-
-.login-hint {
-  margin: 0 0 4px;
-  font-size: 11px;
-  color: #3d4b64;
-}
-
-.login-actions {
-  display: flex;
-  gap: 6px;
-  margin-top: 4px;
-}
-
-.login-actions button {
-  padding: 5px 10px;
-  border: 1px solid #3d67b2;
-  color: #fff;
-  background: #3d67b2;
-  border-radius: 6px;
-  cursor: pointer;
-  font-size: 12px;
-}
-
-.login-actions button:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-
-.login-actions .ghost {
-  color: #223c6d;
-  background: #eef3ff;
-  border-color: #b4c0da;
-}
-
-.login-success {
-  margin: 0;
-  font-size: 12px;
-  color: #1a7f37;
-  font-weight: 500;
-}
-
-.login-error {
-  margin: 4px 0 0;
-  font-size: 11px;
-  color: #7a1c1c;
-  word-break: break-word;
-}
-
 @media (prefers-color-scheme: dark) {
   :root {
     color: #e6ecf5;
@@ -359,7 +298,8 @@ body,
   .card.muted,
   .header p,
   .provider-name,
-  .meta,
+  .plan-tag,
+  .reset-text,
   .status-row {
     color: #9aa6bd;
   }
@@ -375,25 +315,19 @@ body,
     background: rgba(255, 255, 255, 0.03);
     border-color: rgba(255, 255, 255, 0.08);
   }
-  .settings input,
-  .settings select {
+  .settings input {
     background: rgba(0, 0, 0, 0.25);
     color: #e6ecf5;
     border-color: rgba(255, 255, 255, 0.12);
   }
-  .login-section {
-    background: rgba(255, 255, 255, 0.04);
-    border-color: rgba(255, 255, 255, 0.08);
-  }
-  .warning {
+  .banner-warning {
     background: rgba(212, 179, 77, 0.12);
   }
-  .error,
+  .banner-error,
   .card-error {
     background: rgba(209, 67, 67, 0.12);
   }
   .card-error-msg,
-  .cached-msg,
   .cached-badge {
     color: #d6b45a;
   }

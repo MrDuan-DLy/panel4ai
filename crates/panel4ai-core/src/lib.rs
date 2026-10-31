@@ -61,6 +61,10 @@ pub struct SnapshotEnvelope {
     pub snapshots: Vec<UsageSnapshot>,
     #[serde(default)]
     pub provider_errors: HashMap<String, String>,
+    /// Push providers with no recent data, mapped to their last push (0 = never).
+    /// Separate from `provider_errors`: a sleeping Mac is not a collection failure.
+    #[serde(default)]
+    pub stale_providers: HashMap<String, i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -68,6 +72,8 @@ pub struct ProviderPaths {
     pub codex_auth_path: PathBuf,
     pub codex_binary_path: Option<PathBuf>,
     pub claude_auth_path: PathBuf,
+    pub grok_binary_path: Option<PathBuf>,
+    pub grok_home: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -229,6 +235,41 @@ struct AppServerRateLimitWindow {
     resets_at: Option<i64>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct GrokBillingResponse {
+    config: Option<GrokBillingConfig>,
+    #[serde(alias = "subscriptionTier")]
+    subscription_tier: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct GrokBillingConfig {
+    credit_usage_percent: Option<f64>,
+    current_period: Option<GrokUsagePeriod>,
+    billing_period_start: Option<String>,
+    billing_period_end: Option<String>,
+    monthly_limit: Option<GrokCent>,
+    used: Option<GrokCent>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct GrokUsagePeriod {
+    #[serde(rename = "type")]
+    period_type: Option<String>,
+    start: Option<String>,
+    end: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct GrokCent {
+    // Proto JSON omits zero, so `{}` means 0 cents.
+    val: f64,
+}
+
 #[derive(Debug, Deserialize)]
 struct ClaudeUsageResponse {
     #[serde(flatten)]
@@ -363,7 +404,7 @@ impl QuotaClient {
         let mut stdout = BufReader::new(stdout);
 
         let result = async {
-            write_app_server_message(
+            write_rpc_message(
                 &mut stdin,
                 serde_json::json!({
                     "method": "initialize",
@@ -378,13 +419,13 @@ impl QuotaClient {
                 }),
             )
             .await?;
-            read_app_server_response(&mut stdout, 1).await?;
-            write_app_server_message(
+            read_rpc_response(&mut stdout, 1, "Codex app-server").await?;
+            write_rpc_message(
                 &mut stdin,
                 serde_json::json!({ "method": "initialized", "params": {} }),
             )
             .await?;
-            write_app_server_message(
+            write_rpc_message(
                 &mut stdin,
                 serde_json::json!({
                     "method": "account/rateLimits/read",
@@ -393,13 +434,88 @@ impl QuotaClient {
                 }),
             )
             .await?;
-            let response = read_app_server_response(&mut stdout, 2).await?;
+            let response = read_rpc_response(&mut stdout, 2, "Codex app-server").await?;
             parse_app_server_rate_limits(response)
         }
         .await;
         drop(stdin);
         stop_child(&mut child).await;
         result.map(|limits| self.app_server_openai_snapshots(limits))
+    }
+
+    /// Reads the SuperGrok pool through the official CLI so that it, not this
+    /// process, owns the short-lived login token and its refresh.
+    pub async fn fetch_grok(&self) -> Result<Vec<UsageSnapshot>, ProviderError> {
+        let binary_path = self.paths.grok_binary_path.as_deref().ok_or_else(|| {
+            ProviderError::MissingCredentials("Grok CLI path is not configured".to_string())
+        })?;
+        let grok_home = self.paths.grok_home.as_deref().ok_or_else(|| {
+            ProviderError::MissingCredentials("Grok home is not configured".to_string())
+        })?;
+        let home = grok_home.parent().unwrap_or(grok_home);
+        let mut command = Command::new(binary_path);
+        command
+            .args(["agent", "--no-leader", "stdio"])
+            .current_dir(grok_home)
+            .env("HOME", home)
+            .env("GROK_HOME", grok_home)
+            .env("GROK_DISABLE_AUTOUPDATER", "1")
+            .env_remove("XAI_API_KEY")
+            .env_remove("GROK_API_KEY")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let mut child = command.spawn().map_err(|error| {
+            ProviderError::Transport(format!(
+                "cannot start Grok CLI at {}: {error}",
+                binary_path.display()
+            ))
+        })?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| ProviderError::Transport("Grok CLI stdin is unavailable".to_string()))?;
+        let stdout = child.stdout.take().ok_or_else(|| {
+            ProviderError::Transport("Grok CLI stdout is unavailable".to_string())
+        })?;
+        let mut stdout = BufReader::new(stdout);
+
+        let result = async {
+            write_rpc_message(
+                &mut stdin,
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": 1,
+                        "clientCapabilities": {},
+                        "clientInfo": {
+                            "name": "panel4ai",
+                            "version": env!("CARGO_PKG_VERSION")
+                        }
+                    }
+                }),
+            )
+            .await?;
+            read_rpc_response(&mut stdout, 1, "Grok CLI").await?;
+            write_rpc_message(
+                &mut stdin,
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "_x.ai/billing",
+                    "params": {}
+                }),
+            )
+            .await?;
+            read_rpc_response(&mut stdout, 2, "Grok CLI").await
+        }
+        .await;
+        drop(stdin);
+        stop_child(&mut child).await;
+        grok_snapshots(result?, self.alert_threshold_percent)
     }
 
     pub async fn fetch_claude(&self) -> Result<Vec<UsageSnapshot>, ProviderError> {
@@ -650,59 +766,167 @@ impl QuotaClient {
     }
 }
 
-async fn write_app_server_message(
+async fn write_rpc_message(
     stdin: &mut tokio::process::ChildStdin,
     message: Value,
 ) -> Result<(), ProviderError> {
     let mut encoded = serde_json::to_vec(&message)
         .map_err(|error| ProviderError::InvalidResponse(error.to_string()))?;
     encoded.push(b'\n');
-    stdin.write_all(&encoded).await.map_err(|error| {
-        ProviderError::Transport(format!("cannot write to Codex app-server: {error}"))
-    })?;
-    stdin.flush().await.map_err(|error| {
-        ProviderError::Transport(format!("cannot flush Codex app-server request: {error}"))
-    })
+    stdin
+        .write_all(&encoded)
+        .await
+        .map_err(|error| ProviderError::Transport(format!("cannot write to child CLI: {error}")))?;
+    stdin
+        .flush()
+        .await
+        .map_err(|error| ProviderError::Transport(format!("cannot flush child CLI: {error}")))
 }
 
-async fn read_app_server_response(
+async fn read_rpc_response(
     stdout: &mut BufReader<ChildStdout>,
     expected_id: i64,
+    label: &str,
 ) -> Result<Value, ProviderError> {
-    timeout(Duration::from_secs(20), async {
+    timeout(Duration::from_secs(30), async {
         loop {
             let mut line = String::new();
             let bytes = stdout.read_line(&mut line).await.map_err(|error| {
-                ProviderError::Transport(format!("cannot read Codex app-server response: {error}"))
+                ProviderError::Transport(format!("cannot read {label} response: {error}"))
             })?;
             if bytes == 0 {
-                return Err(ProviderError::Transport(
-                    "Codex app-server exited before replying".to_string(),
-                ));
+                return Err(ProviderError::Transport(format!(
+                    "{label} exited before replying"
+                )));
             }
-            let message: Value = serde_json::from_str(&line).map_err(|error| {
-                ProviderError::InvalidResponse(format!(
-                    "invalid Codex app-server JSONL response: {error}"
-                ))
-            })?;
+            let Ok(message) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
             if message.get("id").and_then(Value::as_i64) != Some(expected_id) {
                 continue;
             }
             if let Some(error) = message.get("error") {
-                return Err(ProviderError::Unauthorized(format!(
-                    "Codex app-server request failed: {}",
-                    compact_json(error)
-                )));
+                return Err(classify_rpc_error(label, error));
             }
             return message.get("result").cloned().ok_or_else(|| {
-                ProviderError::InvalidResponse(
-                    "Codex app-server response has no result".to_string(),
-                )
+                ProviderError::InvalidResponse(format!("{label} response has no result"))
             });
         }
     })
     .await
-    .map_err(|_| ProviderError::Transport("Codex app-server timed out".to_string()))?
+    .map_err(|_| ProviderError::Transport(format!("{label} timed out")))?
+}
+
+/// A CLI reports an expired login and an outage through the same JSON-RPC error
+/// field. Only the first should drop polling to the slow re-login schedule.
+fn classify_rpc_error(label: &str, error: &Value) -> ProviderError {
+    let detail = compact_json(error);
+    let message = format!("{label} request failed: {detail}");
+    let lower = detail.to_lowercase();
+    if error.get("code").and_then(Value::as_i64) == Some(-32601) {
+        return ProviderError::InvalidResponse(message);
+    }
+    if lower.contains("429") || lower.contains("rate limit") || lower.contains("rate_limit") {
+        return ProviderError::RateLimited {
+            retry_after_secs: None,
+        };
+    }
+    let auth_markers = [
+        "unauthor",
+        "not logged",
+        "login",
+        "sign in",
+        "signed out",
+        "expired",
+        "token",
+        "credential",
+        "401",
+        "403",
+    ];
+    if auth_markers.iter().any(|marker| lower.contains(marker)) {
+        return ProviderError::Unauthorized(message);
+    }
+    ProviderError::Transport(message)
+}
+
+fn grok_snapshots(value: Value, alert_threshold: f64) -> Result<Vec<UsageSnapshot>, ProviderError> {
+    let response: GrokBillingResponse = serde_json::from_value(value).map_err(|error| {
+        ProviderError::InvalidResponse(format!("invalid Grok billing response: {error}"))
+    })?;
+    let config = response.config.ok_or_else(|| {
+        ProviderError::InvalidResponse("Grok billing response has no config".to_string())
+    })?;
+    let period = config.current_period.as_ref();
+    let end = period
+        .and_then(|period| period.end.as_deref())
+        .or(config.billing_period_end.as_deref())
+        .and_then(parse_rfc3339)
+        .ok_or_else(|| {
+            ProviderError::InvalidResponse("Grok billing response has no period end".to_string())
+        })?;
+    let start = period
+        .and_then(|period| period.start.as_deref())
+        .or(config.billing_period_start.as_deref())
+        .and_then(parse_rfc3339);
+    let used = match (
+        config.credit_usage_percent,
+        &config.used,
+        &config.monthly_limit,
+    ) {
+        (Some(percent), _, _) => percent,
+        // Proto JSON omits a zero percentage right after rollover. Never mix the
+        // deprecated monthly counters into a typed current period.
+        (None, _, _) if period.is_some() => 0.0,
+        (None, Some(used), Some(limit)) if limit.val > 0.0 => used.val / limit.val * 100.0,
+        _ => {
+            return Err(ProviderError::InvalidResponse(
+                "Grok billing response has no usage percentage".to_string(),
+            ))
+        }
+    };
+    let measured_seconds = start
+        .map(|start| end - start)
+        .filter(|seconds| *seconds > 0);
+    let declared = period
+        .and_then(|period| period.period_type.as_deref())
+        .unwrap_or("");
+    let window_type = if declared.contains("WEEKLY") {
+        "weekly"
+    } else if declared.contains("MONTHLY") {
+        "monthly"
+    } else {
+        match measured_seconds {
+            Some(seconds) if seconds <= 8 * 86_400 => "weekly",
+            _ => "monthly",
+        }
+    };
+    let default_seconds = if window_type == "weekly" {
+        604_800
+    } else {
+        2_592_000
+    };
+    let provider = response
+        .subscription_tier
+        .as_deref()
+        .map(str::trim)
+        .filter(|tier| !tier.is_empty())
+        .map(|tier| format!("grok-cli ({tier})"))
+        .unwrap_or_else(|| "grok-cli".to_string());
+    Ok(vec![snapshot(
+        &provider,
+        window_type,
+        used.clamp(0.0, 100.0),
+        end,
+        measured_seconds.unwrap_or(default_seconds),
+        alert_threshold,
+        None,
+    )])
+}
+
+fn parse_rfc3339(value: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|date| date.timestamp())
 }
 
 fn parse_app_server_rate_limits(value: Value) -> Result<AppServerRateLimitsResult, ProviderError> {
@@ -738,7 +962,7 @@ pub fn classify_openai_window(limit_window_seconds: Option<i64>, fallback: &str)
     }
 }
 
-fn snapshot(
+pub fn snapshot(
     provider: &str,
     window_type: &str,
     used: f64,
@@ -976,6 +1200,8 @@ mod tests {
                 codex_auth_path: "/tmp/codex/auth.json".into(),
                 codex_binary_path: None,
                 claude_auth_path: "/tmp/claude/auth.json".into(),
+                grok_binary_path: None,
+                grok_home: None,
             },
             20.0,
         )
@@ -1011,6 +1237,8 @@ mod tests {
                 codex_auth_path: "/tmp/codex/auth.json".into(),
                 codex_binary_path: None,
                 claude_auth_path: "/tmp/claude/auth.json".into(),
+                grok_binary_path: None,
+                grok_home: None,
             },
             20.0,
         )
@@ -1020,6 +1248,88 @@ mod tests {
         assert_eq!(snapshots[0].window_type, "weekly");
         assert_eq!(snapshots[0].remaining_percent, 29.0);
         assert_eq!(snapshots[0].provider, "openai-app-server (prolite)");
+    }
+
+    #[test]
+    fn parses_grok_weekly_billing_from_the_cli() {
+        let snapshots = grok_snapshots(
+            serde_json::json!({
+                "config": {
+                    "creditUsagePercent": 36.0,
+                    "currentPeriod": {
+                        "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                        "start": "2026-10-27T11:38:16.167924+00:00",
+                        "end": "2026-11-03T11:38:16.167924+00:00"
+                    },
+                    "onDemandCap": { "val": 0 },
+                    "onDemandUsed": {},
+                    "billingPeriodStart": "2026-10-27T11:38:16.167924+00:00",
+                    "billingPeriodEnd": "2026-11-03T11:38:16.167924+00:00"
+                }
+            }),
+            20.0,
+        )
+        .expect("valid billing payload");
+        assert_eq!(snapshots.len(), 1);
+        let weekly = &snapshots[0];
+        assert_eq!(weekly.provider, "grok-cli");
+        assert_eq!(weekly.window_type, "weekly");
+        assert_eq!(weekly.remaining_percent, 64.0);
+        assert_eq!(weekly.reset_at, 1_793_705_896);
+        assert_eq!(weekly.window_end - weekly.window_start, 604_800);
+    }
+
+    #[test]
+    fn treats_omitted_grok_percent_in_an_active_period_as_zero() {
+        let snapshots = grok_snapshots(
+            serde_json::json!({
+                "subscription_tier": "SuperGrok",
+                "config": {
+                    "currentPeriod": {
+                        "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                        "start": "2026-10-27T00:00:00Z",
+                        "end": "2026-11-03T00:00:00Z"
+                    },
+                    "monthlyLimit": { "val": 1000 },
+                    "used": { "val": 900 }
+                }
+            }),
+            20.0,
+        )
+        .expect("valid billing payload");
+        assert_eq!(snapshots[0].provider, "grok-cli (SuperGrok)");
+        assert_eq!(snapshots[0].remaining_percent, 100.0);
+    }
+
+    #[test]
+    fn rejects_grok_billing_without_usage_or_period() {
+        assert!(grok_snapshots(serde_json::json!({ "config": {} }), 20.0).is_err());
+        assert!(grok_snapshots(serde_json::json!({}), 20.0).is_err());
+        let missing_usage = serde_json::json!({
+            "config": { "billingPeriodEnd": "2026-11-03T00:00:00Z" }
+        });
+        assert!(grok_snapshots(missing_usage, 20.0).is_err());
+    }
+
+    #[test]
+    fn classifies_cli_rpc_errors() {
+        let classify = |value| classify_rpc_error("CLI", &value);
+        assert!(matches!(
+            classify(serde_json::json!({ "code": -32603, "message": "token_expired" })),
+            ProviderError::Unauthorized(_)
+        ));
+        assert!(matches!(
+            classify(serde_json::json!({ "code": -32601, "message": "Method not found" })),
+            ProviderError::InvalidResponse(_)
+        ));
+        assert!(matches!(
+            classify(serde_json::json!({ "code": -32603, "message": "HTTP 429 rate limited" })),
+            ProviderError::RateLimited { .. }
+        ));
+        assert!(matches!(
+            classify(serde_json::json!({ "code": -32603, "message": "backend unavailable" })),
+            ProviderError::Transport(_)
+        ));
     }
 
     #[test]
