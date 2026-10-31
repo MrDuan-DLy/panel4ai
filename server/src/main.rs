@@ -596,7 +596,7 @@ fn backoff_secs(error: &ProviderError, failures: u32, interval: u64) -> u64 {
     match error {
         ProviderError::RateLimited {
             retry_after_secs: Some(seconds),
-        } if *seconds > 0 => (*seconds).clamp(60, MAX_BACKOFF_SECS),
+        } if *seconds > 0 => (*seconds).max(60),
         ProviderError::Unauthorized(_) | ProviderError::MissingCredentials(_) => {
             if i64::from(failures) < UNAUTHORIZED_ALERT_FAILURES {
                 interval
@@ -646,8 +646,10 @@ async fn handle_provider_result(
                 *streak = streak.saturating_add(1);
                 *streak
             };
-            let wait_until =
-                Utc::now().timestamp() + backoff_secs(&error, failures, interval) as i64;
+            // The provider's Retry-After is a minimum, even when it exceeds our
+            // own backoff cap. Saturate an unrepresentable deadline, never wrap it.
+            let delay = i64::try_from(backoff_secs(&error, failures, interval)).unwrap_or(i64::MAX);
+            let wait_until = Utc::now().timestamp().saturating_add(delay);
             runtime
                 .next_poll_at
                 .insert(provider_key.to_string(), wait_until);
@@ -2515,7 +2517,7 @@ mod tests {
             retry_after_secs: seconds,
         };
         assert_eq!(backoff_secs(&limited(Some(90)), 1, 300), 90);
-        assert_eq!(backoff_secs(&limited(Some(99_999)), 1, 300), 3600);
+        assert_eq!(backoff_secs(&limited(Some(99_999)), 1, 300), 99_999);
         assert_eq!(backoff_secs(&limited(None), 2, 300), 600);
     }
 
@@ -2530,6 +2532,32 @@ mod tests {
         assert!(runtime.next_poll_at.get("openai").copied().unwrap_or(0) > Utc::now().timestamp());
         assert!(!runtime.rate_limited_until.contains_key("openai"));
         assert_eq!(runtime.failure_streak.get("openai"), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn forced_poll_respects_long_and_unrepresentable_retry_after() {
+        for seconds in [7200, u64::MAX] {
+            let state = test_state(None);
+            let before = Utc::now().timestamp();
+            handle_provider_result(
+                &state,
+                "openai",
+                Err(ProviderError::RateLimited {
+                    retry_after_secs: Some(seconds),
+                }),
+            )
+            .await
+            .expect("record rate limit");
+            let deadline = state.runtime.read().await.rate_limited_until["openai"];
+            let expected = before.saturating_add(i64::try_from(seconds).unwrap_or(i64::MAX));
+            assert!(deadline >= expected);
+            poll_provider(&state, "openai", true)
+                .await
+                .expect("skip forced poll until Retry-After");
+            let runtime = state.runtime.read().await;
+            assert_eq!(runtime.rate_limited_until["openai"], deadline);
+            assert_eq!(runtime.failure_streak["openai"], 1);
+        }
     }
 
     #[test]
