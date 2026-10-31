@@ -207,24 +207,24 @@ body,
   font-weight: 500;
 }
 
-.warning,
+.banner-warning,
 .settings,
-.error {
+.banner-error {
   border-radius: 10px;
   padding: 10px;
   font-size: 12px;
 }
 
-.warning {
+.banner-warning {
   border: 1px solid #d4b34d;
   background: #fff6de;
 }
 
-.warning p {
+.banner-warning p {
   margin: 0 0 4px;
 }
 
-.error {
+.banner-error {
   border: 1px solid #d14343;
   background: #ffe6e6;
   color: #7a1c1c;
@@ -320,10 +320,10 @@ body,
     color: #e6ecf5;
     border-color: rgba(255, 255, 255, 0.12);
   }
-  .warning {
+  .banner-warning {
     background: rgba(212, 179, 77, 0.12);
   }
-  .error,
+  .banner-error,
   .card-error {
     background: rgba(209, 67, 67, 0.12);
   }

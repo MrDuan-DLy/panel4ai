@@ -208,7 +208,7 @@ function App() {
             </div>
 
             {savedSettings !== null && !configured && (
-              <div className="warning">
+              <div className="banner-warning">
                 <p>Server is not configured.</p>
                 <p>Open Settings and enter the server URL and access token.</p>
               </div>
@@ -281,7 +281,7 @@ function App() {
           </div>
         )}
 
-        {error && <div className="error">{error}</div>}
+        {error && <div className="banner-error">{error}</div>}
       </div>
     </div>
   )
