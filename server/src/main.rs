@@ -31,6 +31,7 @@ const EARLY_RESET_REASON: &str = "usage_recovery_confirmed";
 const PULL_PROVIDERS: [&str; 3] = ["openai", "claude", "grok"];
 const PROVIDER_TICK_SECS: u64 = 15;
 const MAX_BACKOFF_SECS: u64 = 3600;
+const MAX_RETRY_AFTER_SECS: u64 = 24 * 60 * 60;
 const UNAUTHORIZED_ALERT_FAILURES: i64 = 3;
 const BARK_MAX_AGE_SECS: i64 = 6 * 60 * 60;
 const PUSH_WATCH_INTERVAL_SECS: u64 = 300;
@@ -596,7 +597,7 @@ fn backoff_secs(error: &ProviderError, failures: u32, interval: u64) -> u64 {
     match error {
         ProviderError::RateLimited {
             retry_after_secs: Some(seconds),
-        } if *seconds > 0 => (*seconds).max(60),
+        } if *seconds > 0 => (*seconds).clamp(60, MAX_RETRY_AFTER_SECS),
         ProviderError::Unauthorized(_) | ProviderError::MissingCredentials(_) => {
             if i64::from(failures) < UNAUTHORIZED_ALERT_FAILURES {
                 interval
@@ -646,10 +647,10 @@ async fn handle_provider_result(
                 *streak = streak.saturating_add(1);
                 *streak
             };
-            // The provider's Retry-After is a minimum, even when it exceeds our
-            // own backoff cap. Saturate an unrepresentable deadline, never wrap it.
-            let delay = i64::try_from(backoff_secs(&error, failures, interval)).unwrap_or(i64::MAX);
-            let wait_until = Utc::now().timestamp().saturating_add(delay);
+            // A provider may ask for longer than our own backoff, but only up to a day:
+            // one malformed Retry-After must not silence a provider until the next restart.
+            let wait_until =
+                Utc::now().timestamp() + backoff_secs(&error, failures, interval) as i64;
             runtime
                 .next_poll_at
                 .insert(provider_key.to_string(), wait_until);
@@ -2517,7 +2518,9 @@ mod tests {
             retry_after_secs: seconds,
         };
         assert_eq!(backoff_secs(&limited(Some(90)), 1, 300), 90);
-        assert_eq!(backoff_secs(&limited(Some(99_999)), 1, 300), 99_999);
+        assert_eq!(backoff_secs(&limited(Some(7_200)), 1, 300), 7_200);
+        assert_eq!(backoff_secs(&limited(Some(99_999)), 1, 300), 86_400);
+        assert_eq!(backoff_secs(&limited(Some(u64::MAX)), 1, 300), 86_400);
         assert_eq!(backoff_secs(&limited(None), 2, 300), 600);
     }
 
@@ -2535,7 +2538,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forced_poll_respects_long_and_unrepresentable_retry_after() {
+    async fn forced_poll_respects_a_long_retry_after_up_to_a_day() {
         for seconds in [7200, u64::MAX] {
             let state = test_state(None);
             let before = Utc::now().timestamp();
@@ -2549,8 +2552,9 @@ mod tests {
             .await
             .expect("record rate limit");
             let deadline = state.runtime.read().await.rate_limited_until["openai"];
-            let expected = before.saturating_add(i64::try_from(seconds).unwrap_or(i64::MAX));
+            let expected = before + seconds.min(MAX_RETRY_AFTER_SECS) as i64;
             assert!(deadline >= expected);
+            assert!(deadline <= expected + 60, "a huge value must stay bounded");
             poll_provider(&state, "openai", true)
                 .await
                 .expect("skip forced poll until Retry-After");
