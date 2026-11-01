@@ -40,7 +40,7 @@ Observations, pending candidates and outgoing notifications are durable in SQLit
 
 The `[notify]` section of the server config changes the 5-hour rows.
 
-Failed polls back off: 5, 10, 20 minutes and so on up to an hour. A refused login is retried once an hour after its alert. A `Retry-After` from the provider is always honored.
+Failed polls back off: 5, 10, 20 minutes and so on up to an hour. A refused login is retried once an hour after its alert. A `Retry-After` from the provider is honored up to a day, so a malformed value cannot silence a provider until the next restart.
 
 ## Tech Stack
 
