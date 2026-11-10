@@ -49,3 +49,7 @@ src-tauri/target/
 # OS files
 Thumbs.db
 Desktop.ini
+
+# Python bytecode from deploy/mac tests
+__pycache__/
+*.pyc
